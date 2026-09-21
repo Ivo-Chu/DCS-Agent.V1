@@ -1,0 +1,24 @@
+{
+  "name": "dcs-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DCS Agent v1 - minimal Agent Runtime skeleton (Pi-inspired, zero Pi dependencies)",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/smoke.ts",
+    "test:accept": "tsx test/acceptance.ts",
+    "test:cli": "tsx test/cli-display.ts",
+    "test:live": "tsx test/deepseek-live.ts",
+    "test:accept:live": "tsx test/acceptance-live.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
