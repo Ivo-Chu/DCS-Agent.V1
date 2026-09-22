@@ -1,15 +1,17 @@
 /**
  * dcs/tools.ts
- * v1 三个 DCS 工具 + mock 数据。
+ * v1 三个 DCS 工具 + 数据。
  *
  * 身份一律来自 ctx.session（DcsToolContext），
  * 工具参数 Schema 中不存在任何身份字段 —— 模型无法指定 employeeNo，
  * 真正查询哪个员工由可信的 DcsToolContext 决定。
  *
- * v1 数据口径（方案 §10）：
- * - 菜单表 / 报餐订单 / 餐标配置 均为 mock，不连接真实数据库/API。
- * - search_dcs_code 为极简真实实现：只读遍历
- *   Luxshare.DCS.WebApi/Controllers 下 .cs 文件，命中 ≤5 条。
+ * ★ 数据来源标记（2026-09-22 用户授权）：
+ * - 菜单表 / 报餐订单 / 餐标配置 = TEST DATA（测试数据），仅用于系统集成验证，
+ *   不代表真实 DCS 数据，不得伪装为真实查询结果。
+ * - 正式上线前替换为真实 DCS 只读数据源；届时只替换本文件的数据访问实现，
+ *   正式 Tool 接口（名称/参数/Schema/返回语义）不变。
+ * - search_dcs_code 为真实只读实现（遍历 Controllers .cs），不受本标记影响。
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -17,7 +19,7 @@ import type { ToolDefinition, ToolOutput } from "../core/types.ts";
 import type { DcsToolContext } from "./session.ts";
 
 // ---------------------------------------------------------------------------
-// Mock 菜单表
+// TEST DATA（测试数据）：菜单表 —— 上线前替换为真实 DCS 菜单权限数据源
 // ---------------------------------------------------------------------------
 
 interface MenuDef {
@@ -33,7 +35,7 @@ const MENUS: MenuDef[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Mock 业务数据（仅 10086 有报餐订单数据）
+// TEST DATA（测试数据）：报餐订单 / 餐标 —— 上线前替换为真实 DCS 业务数据源
 // ---------------------------------------------------------------------------
 
 const MEAL_LIMIT_YUAN = 35;
@@ -92,7 +94,7 @@ export const checkDcsPermissionTool: ToolDefinition<CheckPermissionArgs, DcsTool
       };
     }
     return {
-      output: `员工${user.name}（${user.employeeNo}）没有「${menu.menuName}」权限，缺少角色「${menu.allowedRoles.join("或")}」，请联系部门系统管理员或 IT 服务台开通。`,
+      output: `员工${user.name}（${user.employeeNo}）没有「${menu.menuName}」权限，缺少角色「${menu.allowedRoles.join("或")}」，请联系管理员开通。`,
     };
   },
 };

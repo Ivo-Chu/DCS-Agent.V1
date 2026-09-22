@@ -199,7 +199,7 @@ Mock 菜单表：报餐管理（普通员工）、权限管理（系统管理员
 ### 7.1 命令
 
 ```bash
-npm install                  # 安装 devDependencies（typescript / tsx / @types/node）
+npm install                  # 安装依赖（typescript / tsx / @types/node / @wecom/aibot-node-sdk）
 npm run typecheck            # tsc --noEmit
 npm test                     # 冒烟测试（68 项，FakeStreamFn，无需 key）
 npm run test:accept          # 三验收场景接线验证（FakeStreamFn，无需 key，不证明模型行为）
@@ -207,6 +207,7 @@ npm run test:cli             # CLI 展示层入口级验证（本地假模型，
 npm run test:live            # DeepSeek 真实 key 适配器单测（需 DEEPSEEK_API_KEY）
 npm run test:accept:live     # 真实 DeepSeek 三问验收（需 DEEPSEEK_API_KEY）
 npm run dev                  # CLI REPL（需 DEEPSEEK_API_KEY）
+npm run wecom:echo           # 企业微信长连接 Echo（Step 1，需 WECOM_BOT_ID / WECOM_BOT_SECRET）
 ```
 
 PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export DEEPSEEK_API_KEY="sk-xxxxxxxx"`。
@@ -218,7 +219,44 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 | `DEEPSEEK_API_KEY` | dev / test:live | DeepSeek API 密钥，未设置时 CLI 与 live 测试优雅退出 |
 | `DEEPSEEK_BASE_URL` | 否 | 默认 `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-chat` |
+| `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
+| `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
 | `DCS_SOURCE_ROOT` | 否 | search_dcs_code 的源码根目录，默认 `D:\Projects\DCS` |
+
+### 7.2.1 企业微信接入（v2 方案）
+
+**架构**：WeCom 只是 Channel/Adapter，与 Agent Runtime 完全分离——`src/wecom/` 不 import core 的任何类型概念，Agent 组装只用既有 dcs 工厂。CLI 入口保留，企微为平级新入口。
+
+```
+真实企微员工 → WSClient（@wecom/aibot-node-sdk 长连接）
+→ msgid 去重（wecom/dedup.ts，内存 TTL）
+→ Identity Resolver（dcs/identity.ts，当前 TEST DATA，上线前换真实数据源）
+→ 输入确认状态机（wecom/conversation.ts：IDLE/COLLECTING/PROCESSING）
+→ AgentRunner（wecom/agent-runner.ts：runId + 90s 预算 + abort + 迟到丢弃）
+→ Existing Agent Runtime（core，零改动）→ DCS Tools → 流式回复
+```
+
+| 文件 | 职责 |
+|---|---|
+| `src/wecom/echo.ts` | Step 1 长连接 Echo 验证（**已真实联调通过**：认证、收消息、真实 userid `5759529`、回复送达） |
+| `src/wecom/dedup.ts` | msgid 内存去重 + 10min TTL 惰性清扫 |
+| `src/wecom/conversation.ts` | 输入确认状态机 + 多员工会话隔离 + 30min 空闲回收（纯逻辑，依赖注入可测） |
+| `src/wecom/agent-runner.ts` | 超时控制：占位语→Run→最终回复；超时 abort+废弃实例+受控提示；迟到结果丢弃 |
+| `src/wecom/bot.ts` | 正式入口：凭据校验、身份解析（未登记中性拒答）、按 userid 建 Agent（每用户独立 streamFn/取消信号）、群聊谢绝 |
+| `identity.json` | userid→DCS 身份映射（**gitignored，TEST DATA**；`identity.example.json` 为模板） |
+
+交互规则：多条消息合并（确认词：发送完毕/完毕/确认）；处理中新消息回复"上一问正在处理中"；超时回复"这次查询超时，请稍后重试"；未登记身份回复中性话术。已按审查 §十一删除所有编造联系信息（8888 分机等），全链路话术卫生有测试锁定（wecom.test.ts 场景 Q）。
+
+启动：
+
+```powershell
+$env:WECOM_BOT_ID = "xxxx"; $env:WECOM_BOT_SECRET = "xxxx"; $env:DEEPSEEK_API_KEY = "sk-xxxx"
+npm run wecom:bot
+```
+
+可选环境变量：`WECOM_RUN_BUDGET_MS`（Agent 处理预算，默认 90000）、`DCS_IDENTITY_FILE`（身份映射文件路径）。
+
+**当前状态**：Step 1 已真实联调通过；Step 2/4/5/6/7/8 代码与确定性测试完成（Channel 层 35 项测试）；**真实员工端到端验收（Step 9）未验证**——需配置凭据后真人测试。DCS 业务数据为明确标记的 TEST DATA（集成验证用），正式上线前替换数据源（见 §9.3）。
 
 ### 7.3 测试覆盖（当前状态）
 
@@ -228,10 +266,15 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 | 冒烟测试（smoke.ts，12 场景 68 项，含审查 F/R 全部回归） | ✅ 68/68 |
 | 验收接线（acceptance.ts，FakeStreamFn 预置剧本） | ✅ 全过（仅证明接线，不证明模型行为） |
 | CLI 展示层入口级验证（cli-display.ts，本地假模型） | ✅ 5/5 |
+| 身份映射逻辑（identity.test.ts） | ✅ 7/7 |
+| 身份链路（identity-live.ts，真实 userid 5759529 + TEST DATA） | ✅ 5/5 |
+| Channel 层（wecom.test.ts：状态机/隔离/去重/超时/迟到丢弃/话术卫生） | ✅ 35/35 |
+| 企微长连接 Echo（Step 1，真实联调） | ✅ 2026-09-22 通过（真实 userid/msgid/回复送达） |
 | core 纯净度（无 DCS import） | ✅ grep 验证 |
 | 验收判定对抗（smoke 场景 K：错误字符串含关键词必须 FAIL） | ✅ 4/4 |
 | DeepSeek 真实 key 适配器单测（test:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` |
 | 真实 DeepSeek 三问验收（test:accept:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY`，不以假模型代替 |
+| 企微→Agent→回复 端到端（Step 9 真人验收） | ⏸ **未验证**——需凭据配置后真人测试 |
 
 冒烟测试验证点：prompts / context / newMessages 边界与调用方数组不可变性、多 Turn 循环、ToolCall→execute→ToolResult→下一轮 LLM 回填、Agent 状态写回、脱敏管线（含"脱敏发生在回填模型之前"）、beforeToolCall 阻断扩展点、maxTurns 保护（含耗尽时终止说明）、StreamFn 永不 reject 契约，以及审查回归：SSE 坏帧 / 无 finish_reason EOF 编码为 error（H1–H5）、length 截断残缺 toolCalls 剥离与序列化配对（I1–I6）、Hook 异常兜底不泄原文 / 不击穿 Run（J1–J7）。
 

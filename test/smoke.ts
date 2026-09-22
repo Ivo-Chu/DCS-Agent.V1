@@ -143,7 +143,7 @@ section("A. 权限诊断（check_dcs_permission → 无权限 → 最终回答�
         { name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' },
       ],
     },
-    { text: "你缺少系统管理员角色，请联系部门系统管理员或 IT 服务台开通。" },
+    { text: "你缺少系统管理员角色，请联系管理员开通。" },
   ]);
 
   const events: string[] = [];
@@ -327,7 +327,7 @@ section("E. search_dcs_code 只读检索 + 最终输出不含源码路径");
   // E4: 完整链路 —— 模型内部看到检索结果，最终回复不含源码路径
   const { streamFn, requests } = createFakeStreamFn([
     { toolCalls: [{ name: "search_dcs_code", arguments: '{"keyword":"Employee"}' }] },
-    { text: "经内部核查，员工信息查询功能当前可以正常使用。如果你在页面上看不到相关入口，请刷新页面后重试；仍不行请联系 IT 服务台（分机 8888）。" },
+    { text: "经内部核查，员工信息查询功能当前可以正常使用。如果你在页面上看不到相关入口，请刷新页面后重试；仍不行请联系管理员。" },
   ]);
   const agent = makeAgent(streamFn, dcsTools, dcsCtx, createDcsToolHooks());
   const finalText = await agent.prompt("员工信息查询怎么用不了");

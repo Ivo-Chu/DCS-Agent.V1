@@ -6,10 +6,13 @@
   "description": "DCS Agent v1 - minimal Agent Runtime skeleton (Pi-inspired, zero Pi dependencies)",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "wecom:echo": "tsx src/wecom/echo.ts",
+    "wecom:bot": "tsx src/wecom/bot.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx test/smoke.ts",
     "test:accept": "tsx test/acceptance.ts",
     "test:cli": "tsx test/cli-display.ts",
+    "test:wecom": "tsx test/wecom.test.ts",
     "test:live": "tsx test/deepseek-live.ts",
     "test:accept:live": "tsx test/acceptance-live.ts"
   },
@@ -20,5 +23,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.7"
   }
 }

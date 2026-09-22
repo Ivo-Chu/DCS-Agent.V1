@@ -98,7 +98,7 @@ console.log("=== 验收场景 1：为什么我没有权限管理菜单 ===");
     { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' }] },
     {
       text:
-        "你目前没有「权限管理」菜单权限：缺少系统管理员角色。如需开通，请联系部门系统管理员或 IT 服务台（分机 8888）处理。",
+        "你目前没有「权限管理」菜单权限：缺少系统管理员角色。如需开通，请联系管理员处理。",
     },
   ]);
   const finalText = await agent.prompt("为什么我没有权限管理菜单");

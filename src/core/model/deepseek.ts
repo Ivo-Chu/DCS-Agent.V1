@@ -20,6 +20,13 @@ export interface DeepSeekOptions {
   apiKey?: string;
   baseUrl?: string;
   model?: string;
+  /**
+   * 每次模型调用的取消信号提供者（超时控制用）。
+   * 每次调用时求值；返回的 signal 一旦 aborted，
+   * 该 signal 上的后续请求也会立即中止——可用于阻止旧 Run 发起新模型请求。
+   * 不改变 StreamFn 对外契约（core 接口零改动）。
+   */
+  signalProvider?: () => AbortSignal | undefined;
 }
 
 interface OpenAiToolCall {
@@ -110,6 +117,10 @@ export function createDeepSeekStreamFn(options: DeepSeekOptions = {}): StreamFn 
       }));
     }
 
+    // 每次调用求值（超时 abort 后 signal 保持 aborted，
+    // 旧 Run 的后续模型请求会立即中止）
+    const signal = options.signalProvider?.();
+
     let response: Response;
     try {
       response = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
@@ -119,12 +130,13 @@ export function createDeepSeekStreamFn(options: DeepSeekOptions = {}): StreamFn 
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
+        signal,
       });
     } catch (err) {
       yield {
         type: "message_end",
         stopReason: "error",
-        errorMessage: `模型调用失败（网络错误）：${String(err)}`,
+        errorMessage: `模型调用失败（${signal?.aborted ? "已取消" : "网络错误"}）：${String(err)}`,
       };
       return;
     }

@@ -44,3 +44,24 @@ export function createMockSession(): DcsSession {
     },
   };
 }
+
+/**
+ * 由已解析的 DCS 身份构造会话（企微链路用）。
+ * userid 来自企微可信消息（body.from.userid），身份字段来自 Identity Resolver；
+ * 当前数据来源为明确标记的测试数据（identity.json），上线前替换数据源即可。
+ */
+export function createSession(
+  identity: { employeeNo: string; name: string; department?: string; roles?: string[] },
+  userid: string
+): DcsSession {
+  return {
+    user: {
+      source: "wecom",
+      userId: userid,
+      employeeNo: identity.employeeNo,
+      name: identity.name,
+      department: identity.department,
+      roles: identity.roles ?? [],
+    },
+  };
+}
