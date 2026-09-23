@@ -229,7 +229,7 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 | `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-chat` |
 | `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
 | `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
-| `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（本机 `D:\work\DCS code`）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
+| `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（指向本机 DCS 源码树，具体路径不入库）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
 
 ### 7.2.1 企业微信接入（v2 方案）
 
@@ -246,7 +246,7 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 
 | 文件 | 职责 |
 |---|---|
-| `src/wecom/echo.ts` | Step 1 长连接 Echo 验证（**已真实联调通过**：认证、收消息、真实 userid `5759529`、回复送达） |
+| `src/wecom/echo.ts` | Step 1 长连接 Echo 验证（**已真实联调通过**：认证、收消息、真实 userid 回调解析、回复送达） |
 | `src/wecom/dedup.ts` | msgid 内存去重 + 10min TTL 惰性清扫 |
 | `src/wecom/conversation.ts` | 输入确认状态机 + 多员工会话隔离 + 30min 空闲回收（纯逻辑，依赖注入可测） |
 | `src/wecom/agent-runner.ts` | 超时控制：占位语→Run→最终回复；超时 abort+废弃实例+受控提示；迟到结果丢弃 |
@@ -275,7 +275,7 @@ npm run wecom:bot
 | 验收接线（acceptance.ts，FakeStreamFn 预置剧本） | ✅ 全过（仅证明接线，不证明模型行为） |
 | CLI 展示层入口级验证（cli-display.ts，本地假模型） | ✅ 5/5 |
 | 身份映射逻辑（identity.test.ts） | ✅ 7/7 |
-| 身份链路（identity-live.ts，真实 userid 5759529 + TEST DATA） | ✅ 5/5 |
+| 身份链路（identity-live.ts，真实 userid + TEST DATA，userid 经 WECOM_TEST_USERID 提供） | ✅ 5/5 |
 | Channel 层（wecom.test.ts：状态机/隔离/去重/超时/迟到丢弃/话术卫生） | ✅ 35/35 |
 | 企微长连接 Echo（Step 1，真实联调） | ✅ 2026-09-22 通过（真实 userid/msgid/回复送达） |
 | core 纯净度（无 DCS import） | ✅ grep 验证 |

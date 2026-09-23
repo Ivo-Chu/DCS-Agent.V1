@@ -37,12 +37,12 @@ console.log("[场景] I. 身份映射（Step 2）");
 {
   const file = writeFixture(
     JSON.stringify({
-      "5759529": { employeeNo: "C000001", name: "测试甲", department: "测试部", roles: ["普通员工"] },
+      "1000001": { employeeNo: "C000001", name: "测试甲", department: "测试部", roles: ["普通员工"] },
       "8888888": { employeeNo: "C000002", name: "测试乙" },
     })
   );
   resetIdentityCache();
-  const a = resolveIdentity("5759529", file);
+  const a = resolveIdentity("1000001", file);
   check("I1 已登记 userid 返回完整身份", a?.employeeNo === "C000001" && a?.name === "测试甲" && a?.department === "测试部" && a?.roles?.[0] === "普通员工", JSON.stringify(a));
   const b = resolveIdentity("8888888", file);
   check("I2 可选字段缺省时 roles 默认空数组", b?.employeeNo === "C000002" && b?.roles?.length === 0, JSON.stringify(b));
@@ -56,18 +56,18 @@ console.log("[场景] I. 身份映射（Step 2）");
   resetIdentityCache();
   let threw = false;
   try {
-    resolveIdentity("5759529", file);
+    resolveIdentity("1000001", file);
   } catch {
     threw = true;
   }
   check("I5 映射文件损坏 → fail fast 抛错", threw);
 }
 {
-  const file = writeFixture(JSON.stringify({ "5759529": { employeeNo: "C000001" } }));
+  const file = writeFixture(JSON.stringify({ "1000001": { employeeNo: "C000001" } }));
   resetIdentityCache();
   let threw = false;
   try {
-    resolveIdentity("5759529", file);
+    resolveIdentity("1000001", file);
   } catch (err) {
     threw = String(err).includes("不完整");
   }
@@ -75,7 +75,7 @@ console.log("[场景] I. 身份映射（Step 2）");
 }
 {
   resetIdentityCache();
-  const missing = resolveIdentity("5759529", path.join(os.tmpdir(), "definitely-missing-identity.json"));
+  const missing = resolveIdentity("1000001", path.join(os.tmpdir(), "definitely-missing-identity.json"));
   check("I7 文件不存在 → null（无人登记）", missing === null);
 }
 

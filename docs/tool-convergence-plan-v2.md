@@ -71,7 +71,7 @@ Tool 负责提供基础能力，不负责为不同自然语言问题预定义业
 
 ## 4. 源码搜索范围
 
-- DCS_SOURCE_ROOT 必须通过环境变量配置（当前本机 DCS_SOURCE_ROOT=D:\work\DCS code），代码中不硬编码路径；未配置时 investigate_dcs_code 明确返回源码调查能力当前不可用。
+- DCS_SOURCE_ROOT 必须通过环境变量配置（指向本机 DCS 源码根目录，具体路径不入库），代码中不硬编码路径；未配置时 investigate_dcs_code 明确返回源码调查能力当前不可用。
 - 允许搜索：Luxshare.DCS.WebApi、Luxshare.DCS.WebApp、Common。
 - 排除：bin、obj、node_modules、dist、.git、.vs、packages、Upload、Images、Content、CSS、Documents、Template、App_Data、ffmpeg、RefDLL、Scripts、fonts、echarts 及其他明显依赖、构建产物、二进制和资源目录。
 - 允许文本源码类型：.cs、.cshtml、.js、.ts、.config、.json、.xml；排除 minified / binary。

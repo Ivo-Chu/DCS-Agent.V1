@@ -68,7 +68,7 @@ session.user.roles: string[]                      // 当前员工角色（identi
 
 ### 2.1 真实 DCS 项目结构勘察结论（2026-09-23 实测）
 
-实际源码根：`D:\work\DCS code`（**当前代码默认的 `D:\Projects\DCS` 不存在**，需更正默认值）。
+实际源码根为本机 DCS 源码目录（具体路径不入库；旧代码默认路径在本机不存在，已更正为必须环境变量配置）。
 
 | 目录 | 内容 | 文件量级 | 判定 |
 |---|---|---|---|
@@ -81,7 +81,7 @@ session.user.roles: string[]                      // 当前员工角色（identi
 
 ### 2.2 search_dcs_code 增强
 
-- **范围**：`DCS_SOURCE_ROOT`（默认改为 `D:\work\DCS code`）下，顶层项目白名单 `[Luxshare.DCS.WebApi, Luxshare.DCS.WebApp, Common]` + 目录名黑名单（任意层级）`bin, obj, node_modules, dist, .git, .vs, packages, Upload, Images, Content, CSS, Documents, Template, App_Data, ffmpeg, RefDLL, Scripts, fonts, echarts` + 扩展名白名单 `.cs, .cshtml, .js, .ts, .config, .json, .xml`（排除 `*.min.js`）；
+- **范围**：`DCS_SOURCE_ROOT`（必须环境变量配置，不硬编码）下，顶层项目白名单 `[Luxshare.DCS.WebApi, Luxshare.DCS.WebApp, Common]` + 目录名黑名单（任意层级）`bin, obj, node_modules, dist, .git, .vs, packages, Upload, Images, Content, CSS, Documents, Template, App_Data, ffmpeg, RefDLL, Scripts, fonts, echarts` + 扩展名白名单 `.cs, .cshtml, .js, .ts, .config, .json, .xml`（排除 `*.min.js`）；
 - **上限**：MAX_HITS 5→**20**；MAX_FILES 500→**15000**（估算一次全量遍历读取约 3-8 秒，90s 预算内；单文件 2MB 上限不变）；命中行超 240 字符截断；
 - **凭据文件排除**：文件名匹配 `.env / .pfx / .key / .pem / secrets*` 直接跳过；
 - **输出格式不变**：`相对路径:行号:代码行`；
