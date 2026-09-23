@@ -372,7 +372,7 @@ npm run wecom:bot
 ## 10. 快速上手（开发者）
 
 ```bash
-cd "D:\Projects\DCS Agent.V1"
+cd <DCS-Agent 仓库本地目录>
 npm install
 # PowerShell：
 $env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"

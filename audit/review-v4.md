@@ -1,7 +1,7 @@
 # GLM 修复全面复审（第三轮 · 独立复核）
 
 - 审查日期：2026-09-21
-- 审查对象：GLM 针对 F1–F6 的代码修复（`D:\Projects\DCS Agent.V1`）
+- 审查对象：GLM 针对 F1–F6 的代码修复（`<DCS-Agent 仓库本地目录>`）
 - 审查依据：原 14 节方案、`audit/review.md`（第一轮）、`audit/review-v2.md`（第二轮）、`audit/review-v3.md`（astra 第三轮）
 - 审查方式：只审不改。源码/测试/配置零改动；复现脚本在系统临时目录执行后已删除
 

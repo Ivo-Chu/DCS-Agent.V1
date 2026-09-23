@@ -9,7 +9,7 @@
 ## 1. 证据范围与限制
 
 - 读完全部 10 个 src 文件、3 个原测试、package.json、tsconfig、lockfile 中相关依赖信息及 WorkBuddy 项目记忆。
-- 本地 Pi 与 DCS 路径存在；`D:\Projects\DCS\Luxshare.DCS.WebApi\Controllers` 存在，当前统计 109 个 `.cs` 文件。项目记忆记载 97 个，与当前不符，但不能据此判断此前发生过什么变更。
+- 本地 Pi 与 DCS 路径存在；`<DCS_SOURCE_ROOT>\Luxshare.DCS.WebApi\Controllers` 存在，当前统计 109 个 `.cs` 文件。项目记忆记载 97 个，与当前不符，但不能据此判断此前发生过什么变更。
 - 对照阅读 Pi 的 Agent / AgentLoop 实现：当前项目是明显简化的独立实现，没有 Pi package/import 依赖，未发现大段照搬证据；这不是对全部 Pi 源码的逐行相似度鉴定。
 - 当前没有 DEEPSEEK_API_KEY，真实 DeepSeek SSE 与真实 CLI 三问未执行。没有把缺 key 当作模型服务故障，也没有把跳过当作通过。
 - 无完整历史操作审计，不能从最终代码证明 WorkBuddy 从未在项目外写文件，或严格按照阶段顺序实施。项目记忆已承认真实模型验证未做，因此第 12 节要求的阶段门槛并未全部满足。
@@ -147,7 +147,7 @@ tsx 失败是当前审查执行环境的限制，未据此认定项目在用户�
 ## 6. 最终目录与模块职责
 
 ```text
-D:\Projects\DCS Agent.V1\
+<DCS-Agent 仓库本地目录>\
 ├── package.json / package-lock.json / tsconfig.json / .gitignore
 ├── src/
 │   ├── core/
