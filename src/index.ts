@@ -11,8 +11,8 @@ import { buildSystemPrompt } from "./dcs/prompt.ts";
 import { createMockSession } from "./dcs/session.ts";
 import { dcsTools } from "./dcs/tools.ts";
 
-/** 内部源码检索工具名（展示层泛化用；完整结果仍回填模型）。 */
-const INTERNAL_SEARCH_TOOL = "search_dcs_code";
+/** 内部源码调查工具名（展示层泛化用；完整结果仍回填模型）。 */
+const INTERNAL_SEARCH_TOOL = "investigate_dcs_code";
 
 async function main(): Promise<void> {
   if (!process.env.DEEPSEEK_API_KEY) {
@@ -33,13 +33,17 @@ async function main(): Promise<void> {
     streamFn: createDeepSeekStreamFn(),
     toolContext: { session },
     hooks: createDcsToolHooks(),
-    maxTurns: 8,
+    // 方案 v2 §9：测试期宽松安全阀（非生产参数）
+    maxTurns: 24,
   });
 
   // R3（审查修复）：统计本轮已流式打印的字符数，
   // prompt() 结束后补打 finalText 中未流式显示过的后缀
   //（截断说明 / maxTurns 终止说明 / 错误附注等 Runtime 后补文本）
   let streamedLen = 0;
+  // 方案 v2 §9：简单统计（CLI 测试入口，与 wecom:bot 同口径）
+  let statTurns = 0;
+  let statToolCalls = 0;
 
   // CLI 是事件唯一消费者
   agent.subscribe((e) => {
@@ -49,6 +53,7 @@ async function main(): Promise<void> {
         process.stdout.write(e.text);
         break;
       case "assistant_message":
+        statTurns++;
         // 工具调用轮结束后换行，隔开下一轮流式输出
         if (e.message.stopReason === "toolCalls") process.stdout.write("\n");
         break;
@@ -58,7 +63,8 @@ async function main(): Promise<void> {
         console.log(`\n[工具调用] ${e.toolName}`);
         break;
       case "tool_execution_end": {
-        // F5 + R4（审查修复）：展示层口径——内部源码检索的结果
+        statToolCalls++;
+        // F5 + R4（审查修复）：展示层口径——内部源码调查的结果
         // 无论成败均不显示原始摘要（错误信息同样可能携带内部路径）
         const shown =
           e.toolName === INTERNAL_SEARCH_TOOL
@@ -103,6 +109,8 @@ async function main(): Promise<void> {
       }
       process.stdout.write("助手> ");
       streamedLen = 0;
+      statTurns = 0;
+      statToolCalls = 0;
       let reply = "";
       try {
         // F6 修复后 prompt() 不应再 reject；此处仅防御性兜底
@@ -115,6 +123,7 @@ async function main(): Promise<void> {
       const suffix = reply.slice(streamedLen);
       if (suffix.length > 0) process.stdout.write(suffix);
       process.stdout.write("\n\n");
+      console.log(`[统计] turns=${statTurns} toolCalls=${statToolCalls}`);
       ask();
     });
   };

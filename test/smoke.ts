@@ -13,6 +13,9 @@
  * 审查回归：H（SSE 边界）、I（length 截断）、J（Hook 异常）、
  *       K（验收判定对抗：错误字符串命中关键词必须 FAIL）。
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { runAgentLoop } from "../src/core/agent-loop.ts";
 import { Agent } from "../src/core/agent.ts";
 import type { AgentEvent } from "../src/core/events.ts";
@@ -29,7 +32,7 @@ import type {
 import { createDeepSeekStreamFn } from "../src/core/model/deepseek.ts";
 import { maskPii, createDcsToolHooks } from "../src/dcs/hooks.ts";
 import { createMockSession, type DcsToolContext } from "../src/dcs/session.ts";
-import { dcsTools, searchDcsCodeTool } from "../src/dcs/tools.ts";
+import { dcsTools, investigateDcsCodeTool } from "../src/dcs/tools.ts";
 import {
   judgeScenario1,
   judgeScenario2,
@@ -258,6 +261,14 @@ section("C. PII 脱敏管线（afterToolCall 在 ToolResult 回填模型之前�
     requests[1]?.messages.some((m) => m.role === "toolResult" && (m as { content: string }).content.includes("138****5678")) === true
   );
   check("C6 maskPii 纯函数：不改变无 PII 文本", maskPii("普通文本 12345") === "普通文本 12345");
+  // 方案 v2 §7：凭据脱敏（Password / Pwd / Secret / Token / ApiKey / AccessKey）
+  const maskedConn = maskPii("Data Source=orcl;User Id=dcs;Password=SuperSecret123;");
+  check("C7 凭据脱敏：connectionString 中 Password 值被脱敏", maskedConn.includes("Password=***") && !maskedConn.includes("SuperSecret123"), maskedConn);
+  const maskedJson = maskPii('"ApiKey": "sk-abc123xyz"');
+  check("C8 凭据脱敏：JSON 形态 ApiKey 值被脱敏", !maskedJson.includes("sk-abc123xyz"), maskedJson);
+  const maskedSecret = maskPii("secret = hunter2 words");
+  check("C9 凭据脱敏：secret 赋值被脱敏", !maskedSecret.includes("hunter2"), maskedSecret);
+  check("C10 凭据脱敏：普通属性定义不受影响", maskPii("public string UserName { get; set; }") === "public string UserName { get; set; }");
 }
 
 // ---------------------------------------------------------------------------
@@ -296,49 +307,165 @@ section("D. beforeToolCall 阻断扩展点（core 契约，v1 未启用业务逻
 }
 
 // ---------------------------------------------------------------------------
-// 场景 E：search_dcs_code 真实只读检索 + 最终输出不含源码路径
+// 场景 E：investigate_dcs_code（方案 v2：搜索+上下文融合、范围控制、安全边界、凭据脱敏链路）
+// 自包含 fixture（临时目录），不依赖本机真实 DCS 源码路径。
 // ---------------------------------------------------------------------------
 
-section("E. search_dcs_code 只读检索 + 最终输出不含源码路径");
+section("E. investigate_dcs_code 源码调查（融合搜索/上下文/安全边界/脱敏链路）");
 
 {
-  // E1: 真实命中（DCS 源码只读遍历）
-  const hit = await searchDcsCodeTool.execute({ keyword: "Employee" }, dcsCtx);
-  const hitLines = hit.output.split("\n").filter((l) => l.trim().length > 0);
-  check("E1 关键词 Employee 命中且 ≤5 条", !hit.isError && hitLines.length > 0 && hitLines.length <= 5, hit.output.slice(0, 200));
-  check(
-    "E2 命中格式为 相对路径:行号:代码行",
-    hitLines.every((l) => /^Luxshare\.DCS\.WebApi\/Controllers\/[^:]+:\d+:/.test(l)),
-    hitLines[0]
-  );
-
-  // E2: 无命中
-  const miss = await searchDcsCodeTool.execute({ keyword: "zzz_不存在关键词_qqq" }, dcsCtx);
-  check("E3 无命中时返回未找到提示", miss.output.includes("未找到相关代码"));
-
-  // E3: 目录不可用 → isError（只读、不崩溃）
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dcs-investigate-"));
   const prevRoot = process.env.DCS_SOURCE_ROOT;
-  process.env.DCS_SOURCE_ROOT = "D:\\Projects\\definitely_not_exists";
-  const broken = await searchDcsCodeTool.execute({ keyword: "Employee" }, dcsCtx);
-  if (prevRoot === undefined) delete process.env.DCS_SOURCE_ROOT;
-  else process.env.DCS_SOURCE_ROOT = prevRoot;
-  check("E4 源码目录不可用时返回 isError 而非抛异常", broken.isError === true);
+  process.env.DCS_SOURCE_ROOT = fixtureRoot;
+  try {
+    const write = (rel: string, content: string): void => {
+      const p = path.join(fixtureRoot, rel);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, content, "utf8");
+    };
+    // 允许范围：WebApi / WebApp / Common
+    write(
+      "Luxshare.DCS.WebApi/Controllers/DimissionController.cs",
+      [
+        "using System;",
+        "",
+        "namespace Luxshare.DCS.WebApi.Controllers",
+        "{",
+        "    public class DimissionController : BaseApiController",
+        "    {",
+        "        // 离职流程：协调员信息显示逻辑",
+        "        public object GetCoordinator()",
+        "        {",
+        "            return new { coordinator = \"黄石智通\" };",
+        "        }",
+        "    }",
+        "}",
+      ].join("\n")
+    );
+    write(
+      "Luxshare.DCS.WebApp/Areas/BookDinnerSys/Views/Index.cshtml",
+      ["<h2>报餐管理</h2>", "<p>提交报餐申请，超出餐标将被驳回</p>"].join("\n")
+    );
+    write("Common/EmployeeHelper.cs", "public static class EmployeeHelper { /* Employee util */ }\n");
+    // 应被排除：白名单外项目 / 黑名单目录 / minified
+    write("Libraries/BigLib.cs", "// 协调员：白名单外项目，不应被命中\n");
+    write("Luxshare.DCS.WebApi/bin/Junk.cs", "// 协调员：黑名单目录，不应被命中\n");
+    write("Luxshare.DCS.WebApp/Scripts/jquery.library.js", "// 协调员：黑名单目录，不应被命中\n");
+    write("Luxshare.DCS.WebApi/bundle.min.js", "// 协调员：minified，不应被命中\n");
+    // 凭据相关：Web.config（允许调查，但值须脱敏）与 secrets.json（直接拒绝）
+    write(
+      "Luxshare.DCS.WebApi/Web.config",
+      [
+        "<configuration>",
+        "  <connectionStrings>",
+        "    <add name=\"Oracle\" connectionString=\"Data Source=orcl;User Id=dcs;Password=SuperSecret123;\" />",
+        "  </connectionStrings>",
+        "</configuration>",
+      ].join("\n")
+    );
+    write("Luxshare.DCS.WebApi/secrets.json", '{"apiKey": "sk-should-never-leak"}\n');
 
-  // E4: 完整链路 —— 模型内部看到检索结果，最终回复不含源码路径
-  const { streamFn, requests } = createFakeStreamFn([
-    { toolCalls: [{ name: "search_dcs_code", arguments: '{"keyword":"Employee"}' }] },
-    { text: "经内部核查，员工信息查询功能当前可以正常使用。如果你在页面上看不到相关入口，请刷新页面后重试；仍不行请联系管理员。" },
-  ]);
-  const agent = makeAgent(streamFn, dcsTools, dcsCtx, createDcsToolHooks());
-  const finalText = await agent.prompt("员工信息查询怎么用不了");
+    // ---- 范围控制（测试重点 1/2）----
+    const hit = await investigateDcsCodeTool.execute({ query: "协调员" }, dcsCtx);
+    check(
+      "E1 全局搜索命中允许项目的业务代码",
+      !hit.isError && hit.output.includes("DimissionController.cs"),
+      hit.output.slice(0, 200)
+    );
+    check("E2 顶层白名单外项目（Libraries）不被搜索", !hit.output.includes("BigLib"));
+    check(
+      "E3 黑名单目录（bin/Scripts）与 minified 文件不被搜索",
+      !hit.output.includes("Junk") && !hit.output.includes("jquery.library") && !hit.output.includes("bundle.min")
+    );
+    const area = await investigateDcsCodeTool.execute({ query: "报餐" }, dcsCtx);
+    check(
+      "E4 WebApp/Areas 业务视图（.cshtml）可被搜索",
+      !area.isError && area.output.includes("BookDinnerSys"),
+      area.output.slice(0, 200)
+    );
 
-  const internalTr = requests[1]?.messages.find((m) => m.role === "toolResult") as { content: string } | undefined;
-  check("E5 模型内部收到了含源码路径的检索结果（供内部诊断）", internalTr?.content.includes("Luxshare.DCS.WebApi/Controllers") === true);
-  check(
-    "E6 最终回复不含源码路径 / .cs / 行号",
-    !finalText.includes("Luxshare") && !finalText.includes(".cs") && !finalText.includes("Controllers") && !/\\Controllers|:\d+:/.test(finalText),
-    finalText
-  );
+    // ---- 渐进式上下文（测试重点 3/4/5）----
+    const ctx3 = await investigateDcsCodeTool.execute({ query: "GetCoordinator" }, dcsCtx);
+    check(
+      "E5 默认上下文：命中行带 > 标记与行号，前后各 3 行（第 8 行命中，5-11 行可见）",
+      !ctx3.isError &&
+        />\s*8\s*\|\s*public object GetCoordinator\(\)/.test(ctx3.output) &&
+        ctx3.output.includes("public class DimissionController") &&
+        ctx3.output.includes("return new { coordinator"),
+      ctx3.output.slice(0, 400)
+    );
+    const ctx0 = await investigateDcsCodeTool.execute({ query: "GetCoordinator", contextLines: 0 }, dcsCtx);
+    const ctx0HitLines = ctx0.output.split("\n").filter((l) => /^>\s*\d/.test(l));
+    check("E6 contextLines=0 时仅返回命中行本身（体积受控）", ctx0HitLines.length === 1, ctx0.output);
+
+    // ---- path 限定与聚焦（测试重点 3）----
+    const scoped = await investigateDcsCodeTool.execute({ query: "Employee", path: "Common" }, dcsCtx);
+    check(
+      "E7 path 限定到目录：范围标注正确且只在该范围命中",
+      !scoped.isError && scoped.output.includes("EmployeeHelper") && scoped.output.includes("范围：Common"),
+      scoped.output.slice(0, 200)
+    );
+
+    // ---- 安全边界（测试重点 6/7/8）----
+    const escape1 = await investigateDcsCodeTool.execute({ query: "x", path: "../outside" }, dcsCtx);
+    check("E8 ../ 路径穿越被拒绝（isError）", escape1.isError === true);
+    const escape2 = await investigateDcsCodeTool.execute({
+      query: "x",
+      path: path.join(os.tmpdir(), "elsewhere.cs"),
+    }, dcsCtx);
+    check("E9 DCS_SOURCE_ROOT 外绝对路径被拒绝", escape2.isError === true);
+    const cred = await investigateDcsCodeTool.execute({
+      query: "apiKey",
+      path: "Luxshare.DCS.WebApi/secrets.json",
+    }, dcsCtx);
+    check("E10 凭据文件（secrets.json）被拒绝访问", cred.isError === true && !cred.output.includes("sk-should-never-leak"));
+
+    // ---- 能力可用性（测试重点 11）----
+    delete process.env.DCS_SOURCE_ROOT;
+    const unavailable = await investigateDcsCodeTool.execute({ query: "Employee" }, dcsCtx);
+    check(
+      "E11 未配置 DCS_SOURCE_ROOT 时明确返回能力不可用",
+      unavailable.isError === true && unavailable.output.includes("不可用")
+    );
+    process.env.DCS_SOURCE_ROOT = fixtureRoot;
+
+    // ---- 完整链路：ToolResult 回填模型（含上下文），模型基于证据回答（测试重点 9/10）----
+    const { streamFn, requests } = createFakeStreamFn([
+      { toolCalls: [{ name: "investigate_dcs_code", arguments: '{"query":"协调员"}' }] },
+      { text: "经源码调查，离职流程的协调员显示逻辑位于 DimissionController 的 GetCoordinator 方法：即使厂区勾选了无需协调员，该方法仍返回协调员信息，属于显示逻辑分支问题。建议将此定位结论反馈给管理员核实。" },
+    ]);
+    const agentE = makeAgent(streamFn, dcsTools, dcsCtx, createDcsToolHooks());
+    const finalText = await agentE.prompt("黄石智通已勾选无需协调员，为什么离职流程还会显示协调员信息");
+    const internalTr = requests[1]?.messages.find((m) => m.role === "toolResult") as { content: string } | undefined;
+    check(
+      "E12 模型内部收到含命中位置与上下文的调查结果（相对路径+行号+>标记）",
+      internalTr?.content.includes("DimissionController.cs") === true && internalTr.content.includes(">") === true
+    );
+    check(
+      "E13 能力释放：模型可基于源码证据给出定位结论（剧本即新原则预期行为）",
+      finalText.includes("GetCoordinator") && finalText.includes("显示逻辑")
+    );
+
+    // ---- 凭据脱敏链路：Web.config 调查结果进模型前脱敏（测试重点 9）----
+    const { streamFn: sfCfg, requests: reqCfg } = createFakeStreamFn([
+      { toolCalls: [{ name: "investigate_dcs_code", arguments: '{"query":"connectionString","path":"Luxshare.DCS.WebApi/Web.config"}' }] },
+      { text: "系统配置了 Oracle 数据库连接。" },
+    ]);
+    const agentCfg = makeAgent(sfCfg, dcsTools, dcsCtx, createDcsToolHooks());
+    await agentCfg.prompt("系统连的什么数据库");
+    const cfgTr = reqCfg[1]?.messages.find((m) => m.role === "toolResult") as { content: string } | undefined;
+    check(
+      "E14 Web.config 可被调查且进入模型前凭据已脱敏（Password=***，原值不出现）",
+      cfgTr?.content.includes("connectionString") === true &&
+        cfgTr.content.includes("Password=***") === true &&
+        cfgTr.content.includes("SuperSecret123") === false,
+      cfgTr?.content?.slice(0, 300)
+    );
+  } finally {
+    if (prevRoot === undefined) delete process.env.DCS_SOURCE_ROOT;
+    else process.env.DCS_SOURCE_ROOT = prevRoot;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------

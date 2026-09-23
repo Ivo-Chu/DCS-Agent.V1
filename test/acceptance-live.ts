@@ -80,7 +80,8 @@ async function main() {
     streamFn: createDeepSeekStreamFn(),
     toolContext: { session },
     hooks: createDcsToolHooks(),
-    maxTurns: 8,
+    // 方案 v2 §9：测试期宽松安全阀（非生产参数）
+    maxTurns: 24,
   });
 
   const events: AgentEvent[] = [];
@@ -135,13 +136,41 @@ async function main() {
     console.log("    ✓ 历史上下文持续累积（newMessages 写回）");
   }
 
+  // ---- 场景 4（方案 v2 §12 核心验收 Case）：源码自主调查 ----
+  // 不提示任何搜索关键词，观察模型能否：
+  // 理解问题 → 自主调用 investigate_dcs_code → 选择下一条线索 → 再次调用 →
+  // 综合证据 → 给出有依据的业务解释。
+  console.log("\n=== 场景 4：核心验收 Case——离职流程协调员显示（源码自主调查） ===");
+  if (!process.env.DCS_SOURCE_ROOT) {
+    console.log("    ⏸ SKIPPED：未配置 DCS_SOURCE_ROOT，源码调查能力不可用，本场景不执行（跳过 ≠ 通过）。");
+    console.log("       配置后运行：$env:DCS_SOURCE_ROOT = 'D:\\work\\DCS code'（PowerShell）");
+  } else {
+    const reply4 = await run("黄石智通已勾选无需协调员，为什么离职流程还会显示协调员信息");
+    const qe4 = collect(events);
+    const investigates = qe4.toolEnds.filter((t) => t.toolName === "investigate_dcs_code");
+    const investigateOk = investigates.some((t) => !t.isError);
+    const reasons: string[] = [];
+    if (!investigateOk) reasons.push("未成功执行任何 investigate_dcs_code（源码自主调查未发生）");
+    if (qe4.agentErrors.length > 0) reasons.push(`存在 agent_error：${qe4.agentErrors.join("; ")}`);
+    if (qe4.lastAssistantStop !== "stop") reasons.push(`末轮非自然 stop：${String(qe4.lastAssistantStop)}`);
+    if (!reply4.includes("协调员")) reasons.push("回复未围绕「协调员」展开（缺少与问题直接相关的结论）");
+    if (reasons.length === 0) {
+      console.log(`    ✓ 场景 4 判定通过（investigate_dcs_code 成功 ${investigates.filter((t) => !t.isError).length} 次，回复含业务解释）`);
+      console.log("    [观察要点] 模型是否自主选择关键词、是否多轮深入、推理链是否区分事实/推断——详见上方回复全文");
+    } else {
+      failed++;
+      console.log("    ✗ 场景 4 判定未通过");
+      for (const r of reasons) console.log(`        - ${r}`);
+    }
+  }
+
   // ---- 汇总 ----
   console.log("\n========== 验收结果 ==========");
   if (failed > 0) {
     console.log(`FAIL：${failed} 项判定未通过（真实 DeepSeek）`);
     process.exit(1);
   }
-  console.log("PASS：三个验收场景全部通过（真实 DeepSeek）");
+  console.log("PASS：验收场景全部通过（真实 DeepSeek）");
   console.log("[证据留存] 各场景实际回复全文、工具调用成败、历史消息数见上方日志。");
 }
 

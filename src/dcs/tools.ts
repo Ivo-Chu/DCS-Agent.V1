@@ -1,17 +1,24 @@
 /**
  * dcs/tools.ts
- * v1 三个 DCS 工具 + 数据。
+ * DCS 工具集（方案 v2：docs/tool-convergence-plan-v2.md）。
+ *
+ * 目标架构：query_dcs_data（暂缓）+ investigate_dcs_code（本轮实现）。
  *
  * 身份一律来自 ctx.session（DcsToolContext），
  * 工具参数 Schema 中不存在任何身份字段 —— 模型无法指定 employeeNo，
  * 真正查询哪个员工由可信的 DcsToolContext 决定。
+ *
+ * ★ Legacy 工具（本轮保留、不再扩展，待 query_dcs_data 上线后替换删除）：
+ * - check_dcs_permission / query_business_data
  *
  * ★ 数据来源标记（2026-09-22 用户授权）：
  * - 菜单表 / 报餐订单 / 餐标配置 = TEST DATA（测试数据），仅用于系统集成验证，
  *   不代表真实 DCS 数据，不得伪装为真实查询结果。
  * - 正式上线前替换为真实 DCS 只读数据源；届时只替换本文件的数据访问实现，
  *   正式 Tool 接口（名称/参数/Schema/返回语义）不变。
- * - search_dcs_code 为真实只读实现（遍历 Controllers .cs），不受本标记影响。
+ *
+ * ★ investigate_dcs_code：真实只读实现（方案 v2 §3-§6），
+ *   搜索 + 定位 + 上下文融合，取代原 search_dcs_code。
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -48,7 +55,7 @@ function fmtDate(d: Date): string {
 }
 
 // ---------------------------------------------------------------------------
-// 工具 1：check_dcs_permission
+// Legacy 工具 1：check_dcs_permission（TEST DATA，待 query_dcs_data 替换）
 // ---------------------------------------------------------------------------
 
 export interface CheckPermissionArgs {
@@ -100,7 +107,7 @@ export const checkDcsPermissionTool: ToolDefinition<CheckPermissionArgs, DcsTool
 };
 
 // ---------------------------------------------------------------------------
-// 工具 2：query_business_data
+// Legacy 工具 2：query_business_data（TEST DATA，待 query_dcs_data 替换）
 // ---------------------------------------------------------------------------
 
 export type BusinessDataType = "报餐订单" | "餐标配置";
@@ -153,104 +160,314 @@ export const queryBusinessDataTool: ToolDefinition<QueryBusinessDataArgs, DcsToo
 };
 
 // ---------------------------------------------------------------------------
-// 工具 3：search_dcs_code（极简真实实现，只读）
+// 工具 3：investigate_dcs_code（方案 v2：搜索 + 定位 + 上下文融合，只读）
+// 取代原 search_dcs_code：模型单次调用即获得命中位置与必要上下文，
+// 需要深入时再次调用同一工具（更具体 query / path 限定 / 更大 contextLines）。
 // ---------------------------------------------------------------------------
 
-export interface SearchDcsCodeArgs {
-  keyword: string;
+export interface InvestigateDcsCodeArgs {
+  query: string;
+  path?: string;
+  contextLines?: number;
 }
 
-const DEFAULT_DCS_ROOT = "D:\\Projects\\DCS";
-const CONTROLLERS_RELATIVE = path.join("Luxshare.DCS.WebApi", "Controllers");
-const MAX_HITS = 5;
-const MAX_FILE_BYTES = 2 * 1024 * 1024; // 单文件读取上限，避免巨型文件拖垮遍历
-const MAX_FILES = 500;
+/** 顶层业务项目白名单（方案 v2 §4）。 */
+const TOP_LEVEL_PROJECTS = ["Luxshare.DCS.WebApi", "Luxshare.DCS.WebApp", "Common"];
 
-function listCsFiles(dir: string, acc: string[] = []): string[] {
-  if (acc.length >= MAX_FILES) return acc;
-  let entries: fs.Dirent[];
+/** 目录黑名单（任意层级，目录名小写比较；依赖 / 构建产物 / 资源）。 */
+const DIR_BLOCKLIST = new Set([
+  "bin", "obj", "node_modules", "dist", ".git", ".vs", "packages",
+  "upload", "images", "content", "css", "documents", "template",
+  "app_data", "ffmpeg", "refdll", "scripts", "fonts", "echarts",
+  "logs", "log",
+]);
+
+/** 允许的文本源码扩展名。 */
+const EXT_ALLOWLIST = new Set([".cs", ".cshtml", ".js", ".ts", ".config", ".json", ".xml"]);
+
+const MAX_FILES = 15000;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/** 单次最多返回的候选命中数（方案 v2 §5：10~20，取 15）。 */
+const MAX_HITS = 15;
+/** 单文件命中上限：防止一个文件刷屏，鼓励用 path 收窄深入。 */
+const MAX_HITS_PER_FILE = 3;
+const DEFAULT_CONTEXT_LINES = 3;
+const MAX_CONTEXT_LINES = 50;
+/** 单行渲染截断。 */
+const MAX_LINE_CHARS = 240;
+/** 单次 ToolResult 总输出保险上限（方案 v2 §5：不会一次返回巨量源码）。 */
+const MAX_OUTPUT_CHARS = 60000;
+
+function isAllowedFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  if (lower.includes(".min.")) return false;
+  // 凭据文件名黑名单：.env/.pfx/.key/.pem 与 secret 前缀文件
+  if (/\.(env|pfx|key|pem)$/.test(lower) || lower.startsWith("secret")) return false;
+  return EXT_ALLOWLIST.has(path.extname(lower));
+}
+
+/** target（resolve 后）必须位于 rootAbs 内：防 ../ 穿越、绝对路径与盘符/UNC 逃逸。 */
+function isInsideRoot(rootAbs: string, target: string): boolean {
   try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
+    const rel = path.relative(rootAbs, target);
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
   } catch {
+    return false;
+  }
+}
+
+/**
+ * 目录 → 允许文件列表的进程内缓存（bot 为长驻进程，首次遍历约 10s+，后续秒级）。
+ * 只缓存路径列表不缓存内容（每次调查仍实时读取文件）；
+ * 测试期不做失效（源码在调查过程中不变，进程重启即刷新）。
+ */
+const listCache = new Map<string, string[]>();
+
+/** 递归收集允许范围内的文件（同步只读，黑名单目录剪枝）。 */
+function listAllowedFiles(dir: string, acc: string[] = []): string[] {
+  const cached = listCache.get(dir);
+  if (cached) {
+    acc.push(...cached.slice(0, Math.max(0, MAX_FILES - acc.length)));
     return acc;
   }
-  for (const e of entries) {
-    if (acc.length >= MAX_FILES) break;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      listCsFiles(p, acc);
-    } else if (e.isFile() && e.name.toLowerCase().endsWith(".cs")) {
-      acc.push(p);
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    if (out.length >= MAX_FILES) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
     }
-  }
+    for (const e of entries) {
+      if (out.length >= MAX_FILES) break;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (DIR_BLOCKLIST.has(e.name.toLowerCase())) continue;
+        walk(p);
+      } else if (e.isFile() && isAllowedFile(e.name)) {
+        out.push(p);
+      }
+    }
+  };
+  walk(dir);
+  listCache.set(dir, out);
+  acc.push(...out.slice(0, Math.max(0, MAX_FILES - acc.length)));
   return acc;
 }
 
-export const searchDcsCodeTool: ToolDefinition<SearchDcsCodeArgs, DcsToolContext> = {
-  name: "search_dcs_code",
-  label: "DCS源码检索",
+/**
+ * 文件内容缓存（bot 长驻进程的多轮调查场景：首次全量读取约 10s，后续毫秒级）。
+ * 总量上限 256MB、单文件 ≤256KB 才缓存，超限后不再缓存新文件（防内存失控）。
+ * 测试期不做失效（源码在调查过程中不变，进程重启即刷新）。
+ */
+const contentCache = new Map<string, string>();
+const CONTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+const CONTENT_CACHE_MAX_FILE_BYTES = 256 * 1024;
+let contentCacheBytes = 0;
+
+/** 读取源码文件（带缓存）：超 2MB / 读取失败返回 null。 */
+function readSourceFile(file: string): string | null {
+  const cached = contentCache.get(file);
+  if (cached !== undefined) return cached;
+  let stat: fs.Stats;
+  let content: string;
+  try {
+    stat = fs.statSync(file);
+    if (stat.size > MAX_FILE_BYTES) return null;
+    content = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  if (stat.size <= CONTENT_CACHE_MAX_FILE_BYTES && contentCacheBytes + content.length * 2 <= CONTENT_CACHE_MAX_BYTES) {
+    contentCache.set(file, content);
+    contentCacheBytes += content.length * 2;
+  }
+  return content;
+}
+
+interface CodeHit {
+  rel: string;
+  lines: string[];
+  start: number; // 0-based，含
+  end: number; // 0-based，不含
+  mark: number; // 命中行（0-based）
+}
+
+function clampContextLines(v: unknown): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : DEFAULT_CONTEXT_LINES;
+  return Math.max(0, Math.min(MAX_CONTEXT_LINES, n));
+}
+
+export const investigateDcsCodeTool: ToolDefinition<InvestigateDcsCodeArgs, DcsToolContext> = {
+  name: "investigate_dcs_code",
+  label: "DCS源码调查",
   description:
-    "在 DCS 系统 WebApi 控制器源码中按关键词检索，返回最多 5 条命中（相对路径:行号:代码行）。用于内部诊断问题根因，结果不得直接透露给用户。",
+    "在 DCS 系统源码中按关键词调查实现证据，返回命中位置及附近代码上下文（相对路径 + 行号）。这是通用调查能力：凡与 DCS 系统相关的问题（业务逻辑、配置、权限、显示规则等），即使没有专用业务工具，都可以用它寻找证据，并且可以多次调用逐步深入。参数：query 为关键词/方法名/字段名/业务名称；path 可选，用上次结果的相对路径限定到某文件或目录以聚焦调查；contextLines 可选，控制每个命中前后返回的上下文行数（默认 3，最大 50）。搜索范围：Luxshare.DCS.WebApi、Luxshare.DCS.WebApp、Common 下的文本源码与配置文件（依赖、构建产物、资源目录已排除）。",
   parameters: {
     type: "object",
     properties: {
-      keyword: {
+      query: {
         type: "string",
-        description: "搜索关键词，例如：报餐、菜单、权限",
+        description: "搜索关键词，例如：协调员、报餐、GetEmployee、connectionString",
+      },
+      path: {
+        type: "string",
+        description:
+          "可选。限定搜索范围：DCS_SOURCE_ROOT 下的相对文件路径或目录路径（使用上次调查结果中返回的相对路径）",
+      },
+      contextLines: {
+        type: "number",
+        description: "可选。每个命中前后返回的上下文行数，默认 3，最大 50",
       },
     },
-    required: ["keyword"],
+    required: ["query"],
   },
   async execute(args, _ctx): Promise<ToolOutput> {
-    const keyword = String(args?.keyword ?? "").trim();
-    if (!keyword) {
-      return { output: "缺少搜索关键词（keyword）。", isError: true };
+    const query = String(args?.query ?? "").trim();
+    if (!query) {
+      return { output: "缺少搜索关键词（query）。", isError: true };
     }
-    const root = process.env.DCS_SOURCE_ROOT ?? DEFAULT_DCS_ROOT;
-    const controllersDir = path.join(root, CONTROLLERS_RELATIVE);
-    if (!fs.existsSync(controllersDir)) {
+
+    // 方案 v2 §4：DCS_SOURCE_ROOT 必须通过环境变量配置，代码不硬编码路径
+    const root = process.env.DCS_SOURCE_ROOT;
+    if (!root) {
       return {
-        output: "源码目录暂时不可用，无法执行代码检索。",
+        output: "源码调查能力当前不可用：未配置 DCS_SOURCE_ROOT 环境变量。",
+        isError: true,
+      };
+    }
+    const rootAbs = path.resolve(root);
+    if (!fs.existsSync(rootAbs) || !fs.statSync(rootAbs).isDirectory()) {
+      return {
+        output: "源码调查能力当前不可用：DCS_SOURCE_ROOT 指向的目录不存在。",
         isError: true,
       };
     }
 
-    const needle = keyword.toLowerCase();
-    const hits: string[] = [];
-    const files = listCsFiles(controllersDir);
-    for (const file of files) {
-      if (hits.length >= MAX_HITS) break;
-      let content: string;
-      try {
-        const stat = fs.statSync(file);
-        if (stat.size > MAX_FILE_BYTES) continue;
-        content = fs.readFileSync(file, "utf8");
-      } catch {
-        continue;
+    // path 参数：限定范围（文件或目录），必须位于 root 内
+    let scopeAbs = rootAbs;
+    let scopeIsFile = false;
+    let scopeLabel = "全部允许源码";
+    const rawPath = args?.path ? String(args.path).trim() : "";
+    if (rawPath) {
+      const resolved = path.resolve(rootAbs, rawPath);
+      if (!isInsideRoot(rootAbs, resolved)) {
+        return { output: "拒绝访问：path 超出 DCS_SOURCE_ROOT 范围。", isError: true };
       }
+      if (!fs.existsSync(resolved)) {
+        return { output: `指定路径不存在：${rawPath}`, isError: true };
+      }
+      const st = fs.statSync(resolved);
+      if (st.isFile()) {
+        if (!isAllowedFile(path.basename(resolved))) {
+          return {
+            output: "拒绝访问：该文件不在允许的源码类型/名单内（凭据或非文本源码文件）。",
+            isError: true,
+          };
+        }
+        scopeIsFile = true;
+      }
+      scopeAbs = resolved;
+      scopeLabel = rawPath;
+    }
+
+    const contextLines = clampContextLines(args?.contextLines);
+
+    // 收集候选文件
+    let files: string[];
+    if (scopeIsFile) {
+      files = [scopeAbs];
+    } else if (
+      scopeAbs === rootAbs &&
+      TOP_LEVEL_PROJECTS.some((p) => fs.existsSync(path.join(rootAbs, p)))
+    ) {
+      // 顶层白名单：真实 DCS 源码树只搜三个业务项目；
+      // 若 root 下无白名单项目（测试 fixture / 其他源码树），退化为全 root 减黑名单
+      files = [];
+      for (const p of TOP_LEVEL_PROJECTS) {
+        const d = path.join(rootAbs, p);
+        if (fs.existsSync(d)) listAllowedFiles(d, files);
+      }
+    } else {
+      files = listAllowedFiles(scopeAbs);
+    }
+
+    // 搜索
+    const needle = query.toLowerCase();
+    const hits: CodeHit[] = [];
+    const perFile = new Map<string, number>();
+    let scanned = 0;
+
+    outer: for (const file of files) {
+      scanned++;
+      const content = readSourceFile(file);
+      if (content === null) continue;
       const lines = content.split(/\r?\n/);
+      const rel = path.relative(rootAbs, file).replace(/\\/g, "/");
+      let fileHits = 0;
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].toLowerCase().includes(needle)) {
-          const rel = path
-            .relative(root, file)
-            .replace(/\\/g, "/");
-          hits.push(`${rel}:${i + 1}:${lines[i].trim()}`);
-          if (hits.length >= MAX_HITS) break;
+          const start = Math.max(0, i - contextLines);
+          const end = Math.min(lines.length, i + 1 + contextLines);
+          hits.push({ rel, lines, start, end, mark: i });
+          fileHits++;
+          if (hits.length >= MAX_HITS) break outer;
+          if (fileHits >= MAX_HITS_PER_FILE) break;
         }
       }
     }
 
     if (hits.length === 0) {
-      return { output: `未找到相关代码（关键词：${keyword}）。` };
+      return {
+        output: `未找到相关代码（关键词：${query}；范围：${scopeLabel}；已扫描 ${scanned} 个文件）。可调整关键词、或通过 path 改变/扩大范围后重试。`,
+      };
     }
-    return { output: hits.join("\n") };
+
+    // 渲染（渐进式：命中行标记 >，上下文行缩进；总体积保险）
+    const parts: string[] = [
+      `调查「${query}」：命中 ${hits.length} 处（范围：${scopeLabel}；扫描 ${scanned} 个文件）`,
+    ];
+    let size = parts[0].length;
+    let outputTruncated = false;
+    for (let h = 0; h < hits.length; h++) {
+      const hit = hits[h];
+      const lines: string[] = [];
+      lines.push(`[${h + 1}] ${hit.rel} 第 ${hit.start + 1}-${hit.end} 行（> 为命中行）：`);
+      for (let i = hit.start; i < hit.end; i++) {
+        const prefix = i === hit.mark ? ">" : " ";
+        const text = renderLine(hit.lines[i]);
+        lines.push(`${prefix}${String(i + 1).padStart(5)} | ${text}`);
+      }
+      const block = lines.join("\n");
+      if (size + block.length > MAX_OUTPUT_CHARS) {
+        outputTruncated = true;
+        break;
+      }
+      parts.push(block);
+      size += block.length;
+    }
+
+    if (hits.length >= MAX_HITS) {
+      parts.push("（已达单次命中上限；可用更具体的 query 或 path 限定范围深入调查）");
+    }
+    if (outputTruncated) {
+      parts.push("（输出体积达上限已截断；可用更具体的 query 或 path 限定范围深入调查）");
+    }
+    return { output: parts.join("\n\n") };
   },
 };
+
+/** 渲染前单行清理：去首尾空白 + 截断超长行。 */
+function renderLine(line: string | undefined): string {
+  const t = (line ?? "").trim();
+  return t.length > MAX_LINE_CHARS ? `${t.slice(0, MAX_LINE_CHARS)}…` : t;
+}
 
 // ---------------------------------------------------------------------------
 
 export const dcsTools: ToolDefinition<any, DcsToolContext>[] = [
   checkDcsPermissionTool,
   queryBusinessDataTool,
-  searchDcsCodeTool,
+  investigateDcsCodeTool,
 ];

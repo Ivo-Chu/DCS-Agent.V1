@@ -178,15 +178,23 @@ DcsToolContext（可信，运行时注入）
 
 ---
 
-## 6. 工具清单（v1 共 3 个）
+## 6. 工具清单（方案 v2：当前 3 个，其中 2 个 Legacy）
 
-| 工具 | 参数 | 数据来源 | 返回示例 |
-|---|---|---|---|
-| `check_dcs_permission` | `menuName`（必填） | Mock 菜单表 × session 角色比对 | 有权限："员工张三（10086，制造一部）拥有「报餐管理」权限"；无权限："缺少角色「系统管理员」，请联系部门系统管理员或 IT 服务台开通"；未匹配："未找到菜单「XX」，现有菜单：…" |
-| `query_business_data` | `dataType`（枚举：报餐订单 / 餐标配置） | Mock（仅 10086 有订单） | 订单逐条：日期 / 状态 / 金额 / 失败原因；餐标：`35 元/人/日，报餐窗口工作日 08:00-10:30` |
-| `search_dcs_code` | `keyword`（必填） | **真实实现**：只读遍历 `D:\Projects\DCS\Luxshare.DCS.WebApi\Controllers` 下 `.cs` 文件 | 命中 ≤5 条 `相对路径:行号:代码行`；无命中返回提示；目录不可用返回 isError |
+| 工具 | 状态 | 参数 | 数据来源 | 说明 |
+|---|---|---|---|---|
+| `check_dcs_permission` | **Legacy**（不再扩展，待 query_dcs_data 替换） | `menuName`（必填） | Mock 菜单表 × session 角色比对 | 有/无权限结论 + 缺少角色提示 |
+| `query_business_data` | **Legacy**（不再扩展，待 query_dcs_data 替换） | `dataType`（枚举：报餐订单 / 餐标配置） | Mock（仅 10086 有订单） | 订单明细 / 餐标配置 |
+| `investigate_dcs_code` | **本轮核心**（取代原 search_dcs_code） | `query`（必填）、`path`（可选）、`contextLines`（可选，默认 3 最大 50） | **真实实现**：DCS 源码只读搜索 + 上下文读取 | 命中 ≤15 处，每处返回相对路径 + 行号 + 命中行（> 标记）+ 前后上下文；模型可多次调用逐步深入 |
 
-`search_dcs_code` 实现细节：精确→包含两级菜单匹配兜底；单文件读取上限 2MB；遍历文件数上限 500；路径可用环境变量 `DCS_SOURCE_ROOT` 覆盖（默认 `D:\Projects\DCS`）；全程只读。
+`investigate_dcs_code` 实现要点（docs/tool-convergence-plan-v2.md）：
+
+- **搜索 + 定位 + 上下文融合**：单次调用即返回命中位置与必要上下文，无需 search→read 两段式；
+- **范围**：顶层项目白名单 `Luxshare.DCS.WebApi / Luxshare.DCS.WebApp / Common` + 目录黑名单（bin/obj/packages/Scripts/Upload/Images/Content 等）+ 扩展名白名单（.cs/.cshtml/.js/.ts/.config/.json/.xml，排除 .min.）；
+- **安全边界**：path 必须 resolve 后位于 `DCS_SOURCE_ROOT` 内（防 ../ 穿越 / 绝对路径 / 盘符 UNC 逃逸）；凭据文件名黑名单（.env/.pfx/.key/.pem/secret*）；单文件 2MB；单次命中 15 处、单文件 3 处；输出总体积 60KB 保险；
+- **性能**：进程内文件列表 + 内容缓存（总量 256MB 上限），长驻 bot 首次全量约 10s、同进程后续约 1s；
+- **凭据防线**：ToolResult 统一过 afterToolCall 脱敏（Password/Pwd/Secret/Token/ApiKey/AccessKey 值 → `***`），Web.config 可调查但连接串密码不会进入模型上下文。
+
+**目标架构**：`query_dcs_data`（数据库方案确定后开发）+ `investigate_dcs_code`。数据库类 Legacy 工具届时统一替换。
 
 **不提供 `get_user_info`**：身份已由 DcsSession 提供，不存在模型查询其他员工身份的场景。
 
@@ -221,7 +229,7 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 | `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-chat` |
 | `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
 | `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
-| `DCS_SOURCE_ROOT` | 否 | search_dcs_code 的源码根目录，默认 `D:\Projects\DCS` |
+| `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（本机 `D:\work\DCS code`）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
 
 ### 7.2.1 企业微信接入（v2 方案）
 
@@ -263,7 +271,7 @@ npm run wecom:bot
 | 测试 | 结果 |
 |---|---|
 | `tsc --noEmit` | ✅ 通过 |
-| 冒烟测试（smoke.ts，12 场景 68 项，含审查 F/R 全部回归） | ✅ 68/68 |
+| 冒烟测试（smoke.ts，13 场景 80 项，含审查 F/R 全部回归 + investigate_dcs_code 安全边界/脱敏链路 14 项） | ✅ 80/80 |
 | 验收接线（acceptance.ts，FakeStreamFn 预置剧本） | ✅ 全过（仅证明接线，不证明模型行为） |
 | CLI 展示层入口级验证（cli-display.ts，本地假模型） | ✅ 5/5 |
 | 身份映射逻辑（identity.test.ts） | ✅ 7/7 |
@@ -273,7 +281,7 @@ npm run wecom:bot
 | core 纯净度（无 DCS import） | ✅ grep 验证 |
 | 验收判定对抗（smoke 场景 K：错误字符串含关键词必须 FAIL） | ✅ 4/4 |
 | DeepSeek 真实 key 适配器单测（test:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` |
-| 真实 DeepSeek 三问验收（test:accept:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY`，不以假模型代替 |
+| 真实 DeepSeek 验收（test:accept:live，含场景 4 源码自主调查核心 Case） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` 与 `DCS_SOURCE_ROOT` 会话变量，不以假模型代替 |
 | 企微→Agent→回复 端到端（Step 9 真人验收） | ⏸ **未验证**——需凭据配置后真人测试 |
 
 冒烟测试验证点：prompts / context / newMessages 边界与调用方数组不可变性、多 Turn 循环、ToolCall→execute→ToolResult→下一轮 LLM 回填、Agent 状态写回、脱敏管线（含"脱敏发生在回填模型之前"）、beforeToolCall 阻断扩展点、maxTurns 保护（含耗尽时终止说明）、StreamFn 永不 reject 契约，以及审查回归：SSE 坏帧 / 无 finish_reason EOF 编码为 error（H1–H5）、length 截断残缺 toolCalls 剥离与序列化配对（I1–I6）、Hook 异常兜底不泄原文 / 不击穿 Run（J1–J7）。
@@ -332,10 +340,32 @@ npm run wecom:bot
 ### 9.2 其余偏差
 
 1. **真实 key 验证未执行**：`DEEPSEEK_API_KEY` 未设置，§12 步骤 2（真实 key 单测）与步骤 5（CLI 真实三问）**未验证（SKIPPED）**，不以假模型代替；`test:live` / `test:accept:live` / `dev` 脚本已就绪，key 到位即可执行。
-2. **maxTurns 默认值 8**（方案未定值，CLI 显式传 8）。
+2. **maxTurns 默认值**（方案未定值，CLI 显式传 8）。
 3. **search_dcs_code 支持 `DCS_SOURCE_ROOT` 覆盖**：为测试可移植性所做的最小调整。
 4. **菜单匹配含包含式兜底**（精确→包含→未找到），防模型传入"权限管理菜单"类模糊名称。
 5. **错误双保险**：StreamFn 违约抛异常 / 工具 execute 抛异常均编码为 error 消息而非崩溃——"永不 reject"契约的自然延伸。
+
+### 9.3 能力释放改造（2026-09-23，方案 v2：docs/tool-convergence-plan-v2.md）
+
+背景：9/22 企微真人测试暴露 prompt 固定路由与技术禁令压制模型能力（见 audit/review-v6.md 诊断）。用户确立"测试阶段最大限度释放能力、按真实失败案例逐步加约束"原则。
+
+本轮变更：
+
+| 变更 | 内容 |
+|---|---|
+| systemPrompt 重写 | 删除 4 条固定工具路由、≤200 字、≤3 步、"建议联系管理员"话术、全面技术禁令；改为能力声明 + 5 条硬边界（事实性结论须有证据支持，允许基于证据的推理并区分已确认/推断/不确定；凭据绝对禁；只查本人；不写操作）；TEST DATA 如实声明 |
+| 工具收敛 | `search_dcs_code` 移除，能力并入新工具 `investigate_dcs_code`（query/path/contextLines，搜索+定位+上下文融合，渐进式返回）；`check_dcs_permission` / `query_business_data` 标记 Legacy 不再扩展 |
+| 源码范围 | 顶层白名单 WebApi/WebApp/Common（覆盖 Areas 业务视图），黑名单目录+扩展名白名单；`DCS_SOURCE_ROOT` 必须显式配置（默认路径硬编码已删除） |
+| 凭据防线 | hooks.ts maskPii 扩展：Password/Pwd/Secret/Token/ApiKey/AccessKey 值统一脱敏（所有工具） |
+| maxTurns | 8 → 24（测试期安全阀，非生产值）；bot/CLI 每 Run 打印 turns/toolCalls 简单统计 |
+| 性能 | 进程内文件列表 + 内容缓存（256MB 上限）：首次全量调查约 10s，同进程后续约 1s |
+
+已知遗留：
+
+1. **live 验收（含场景 4 核心验收 Case："黄石智通已勾选无需协调员…"源码自主调查）未执行**——缺会话级 `DEEPSEEK_API_KEY` 与 `DCS_SOURCE_ROOT`；
+2. **多轮源码调查可能逼近企微 90s 预算**（首次调查约 10s + 模型思考），必要时调 `WECOM_RUN_BUDGET_MS`；Channel 层本轮不动；
+3. **"我有哪些菜单"的回答错误问题（P0）本轮未修**——check_dcs_permission 属 Legacy，按方案 v2 不再扩展，待 query_dcs_data 统一解决；未命中文案歧义仍在（"现有菜单"指系统全量表）；
+4. node_modules 曾缺失 `@wecom/aibot-node-sdk`（环境问题，已按 lockfile 补装）。
 
 ---
 

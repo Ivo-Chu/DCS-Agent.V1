@@ -40,6 +40,8 @@ const GROUP_CHAT_REPLY = "暂时仅支持单聊咨询，请在单聊中与我对
 interface UserAgentEntry {
   agent: Agent<DcsToolContext>;
   controller: AbortController;
+  /** 每 Run 统计（方案 v2 §9：观察真实 Case 的 Loop 深度，非生产观测系统）。 */
+  stats: { turns: number; toolCalls: number };
 }
 
 async function main(): Promise<void> {
@@ -72,6 +74,7 @@ async function main(): Promise<void> {
         throw new Error(`未登记用户 ${userId}`);
       }
       const holder = { controller: new AbortController() };
+      const stats = { turns: 0, toolCalls: 0 };
       const session = createSession(identity, userId);
       const agent = new Agent<DcsToolContext>({
         systemPrompt: buildSystemPrompt(session),
@@ -83,9 +86,15 @@ async function main(): Promise<void> {
         }),
         toolContext: { session },
         hooks: createDcsToolHooks(),
-        maxTurns: 8,
+        // 方案 v2 §9：测试期宽松安全阀（非生产参数）
+        maxTurns: 24,
       });
-      entry = { agent, controller: holder.controller };
+      // 简单统计：每轮 AssistantMessage 计 1 turn，每次工具完成计 1 toolCall
+      agent.subscribe((e) => {
+        if (e.type === "assistant_message") stats.turns++;
+        else if (e.type === "tool_execution_end") stats.toolCalls++;
+      });
+      entry = { agent, controller: holder.controller, stats };
       agents.set(userId, entry);
       console.log(`[bot] 已为用户 ${userId} 创建 Agent（${identity.name}/${identity.employeeNo}，TEST DATA 身份）`);
     }
@@ -119,7 +128,28 @@ async function main(): Promise<void> {
     actions: {
       askConfirm: (token) => replyText(token, CONFIRM_PROMPT),
       notifyBusy: (token) => replyText(token, BUSY_PROMPT),
-      runAgent: (userId, question, token) => runner.run(userId, question, token),
+      runAgent: async (userId, question, token) => {
+        // 方案 v2 §9：每 Run 记录 turns / toolCalls（简单日志，Run 结束打印）
+        let stats: { turns: number; toolCalls: number } | null = null;
+        try {
+          getSlot(userId); // 确保已创建（防御性兜底会抛错，交由 runner.run 处理）
+          const entry = agents.get(userId);
+          if (entry) {
+            stats = entry.stats;
+            stats.turns = 0;
+            stats.toolCalls = 0;
+          }
+        } catch {
+          // getSlot 失败交由 runner.run 统一处理
+        }
+        try {
+          await runner.run(userId, question, token);
+        } finally {
+          if (stats) {
+            console.log(`[bot] run 统计 userid=${userId} turns=${stats.turns} toolCalls=${stats.toolCalls}`);
+          }
+        }
+      },
     },
     onReset: discardAgent,
   });
