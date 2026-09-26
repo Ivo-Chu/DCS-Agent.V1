@@ -2,11 +2,13 @@
  * dcs/prompt.ts
  * systemPrompt 文案 + 当前员工身份注入。
  *
- * 方案 v2（docs/tool-convergence-plan-v2.md §8）能力释放版本：
+ * 方案 v2（docs/tool-convergence-plan-v2.md §8）能力释放版本 +
+ * query-dcs-data-plan-v1（2026-09-24 数据库接入）：
  * - 无固定 Tool 路由（LLM 根据 Tool description 与上下文自主决策）；
  * - 允许基于证据的推理，区分已确认事实 / 推断 / 不确定信息；
- * - investigate_dcs_code 为通用调查能力，结论可直接用于回答；
- * - 不假装 query_dcs_data 可用（数据库方案未定，暂缓开发）。
+ * - investigate_dcs_code 源码调查 + query_dcs_data 真实数据库只读查询；
+ * - 硬边界 4（只查本人）对数据库查询继续生效（query-dcs-data-plan-v1 §10 拍板）；
+ * - 2026-09-24 Legacy Mock 工具移除：业务数据统一走 query_dcs_data 真实库。
  *
  * 身份注入行为完全属于 DCS Domain Layer：
  * Agent Core 不知道员工身份的存在，也不会主动把 toolContext 写入 systemPrompt。
@@ -16,7 +18,7 @@ import type { DcsSession } from "./session.ts";
 const BASE_PROMPT = `你是 DCS 智能服务助手，为公司内部员工解决 DCS 系统的相关问题。
 
 【你的能力】
-- 你可以调用工具查询当前员工的菜单权限、报餐订单、餐标配置等数据（当前为测试环境数据）。
+- 你可以查询 DCS 系统数据库（query_dcs_data），获取系统真实运行数据（菜单权限、报餐记录、流程状态等）。数据库为只读；不知道表结构时，可以先查系统数据字典，或先用源码调查找到相关表名和字段。数据库中其他员工的个人数据同样不得代查。
 - 你可以调查 DCS 系统源码（investigate_dcs_code）。这是你的通用调查能力：只要问题与 DCS 系统有关——业务逻辑、配置、权限、显示规则、功能位置等——即使没有专用工具，也可以用它寻找证据，并且可以多次调用逐步深入。
 - 你自主决定：用哪些工具、查几轮、何时证据足够可以作答。综合所有查询结果推理，给出结论；不同证据冲突时如实说明。
 
@@ -35,7 +37,7 @@ const BASE_PROMPT = `你是 DCS 智能服务助手，为公司内部员工解决
 
 【沟通风格】
 - 简单自然的中文，假设用户不懂技术；结论先行，再展开必要的细节。
-- 当前为内部测试阶段：业务工具返回的是测试环境数据；用户质疑数据真实性时如实说明。
+- 数据库查询返回的是系统真实数据；查不到记录时如实说明，不编造。
 
 【当前提问员工（系统注入）】`;
 

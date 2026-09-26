@@ -1,7 +1,9 @@
 # DCS Agent Tool 收敛方案 v2
 
-> 状态：**已批准，本轮实施依据**（2026-09-23 用户定稿）
-> 取代：docs/capability-release-plan-v1.md 中与本方案冲突的部分（Tool 拆分方式、search/read 融合、DCS_SOURCE_ROOT 配置方式）。
+> 状态：**现行**（已批准，本轮实施依据，2026-09-23 用户定稿）
+> 日期：2026-09-23
+> 取代关系：取代 docs/archive/capability-release-plan-v1.md 中与本方案冲突的部分（Tool 拆分方式、search/read 融合、DCS_SOURCE_ROOT 配置方式）。
+> **2026-09-24 更新**：本方案"迁移策略"中"Legacy 工具测试期并行保留"条款已提前完成——真实库验证（live:db 4/4）通过后，用户授权删除 check_dcs_permission / query_business_data（Mock），业务数据统一走 query_dcs_data（详见 docs/query-dcs-data-plan-v1.md 与 README §9.4）。
 
 ## 1. 本轮目标
 

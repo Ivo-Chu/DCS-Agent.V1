@@ -1,6 +1,8 @@
 # 能力释放实施方案 v1（最终版）
 
-> ⚠️ **状态：已被取代**（2026-09-23）。本文中的独立 read_dcs_file 工具、search/read 两工具拆分、check_dcs_permission 结构化重设计、maxTurns=16、DCS_SOURCE_ROOT 默认值等设计，已被 **docs/tool-convergence-plan-v2.md**（Tool 收敛方案）修订并实施。实施结果见 README §9.3。本文 §2.1 的 DCS 项目结构勘察结论仍然有效。
+> ⛔ 本文档已被 docs/tool-convergence-plan-v2.md 取代，仅存档，勿作为实施依据。
+> 状态：已废弃 · 日期：2026-09-23 · 被取代于：2026-09-23
+> 备注：独立 read_dcs_file、search/read 两工具拆分、check_dcs_permission 结构化重设计、maxTurns=16、DCS_SOURCE_ROOT 默认值等设计已被 v2 修订并实施（见 README §9.3）；本文 §2.1 的 DCS 项目结构勘察结论仍有效。
 
 > 2026-09-23 · 依据 review-v6 + 用户当日七点调整 · 状态：~~方案定稿，待批准实施，未改任何代码~~
 > 目标：Agent 从"只有预定义业务 Tool 能回答问题"→"业务 Tool + DCS 源码自主调查能力，基于证据解决未预定义问题"。

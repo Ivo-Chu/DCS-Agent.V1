@@ -1,10 +1,10 @@
 {
-  "_说明": "复制为 identity.json 并填入真实员工身份（userid 来自企微智能机器人回调 body.from.userid）。identity.json 已加入 .gitignore，禁止提交到 Git。",
+  "_说明": "可选的手动身份覆盖文件（2026-09-24 起正式链路为 S2_Employee 数据库自动解析，本文件仅用于测试时强制指定特定身份）。文件存在且命中 userid 时优先于数据库。已加入 .gitignore，禁止提交到 Git。",
   "_示例": {
     "企微userid（纯数字）": {
-      "employeeNo": "C000000（替换为真实工号）",
-      "name": "（替换为真实姓名）",
-      "department": "（替换为真实部门，可选）",
+      "employeeNo": "C000000（覆盖为指定工号）",
+      "name": "（覆盖为指定姓名）",
+      "department": "（可选）",
       "roles": []
     }
   }

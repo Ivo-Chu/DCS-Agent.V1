@@ -1,166 +1,32 @@
 /**
  * dcs/tools.ts
- * DCS 工具集（方案 v2：docs/tool-convergence-plan-v2.md）。
+ * DCS 工具集（方案 v2 + query-dcs-data-plan-v1）。
  *
- * 目标架构：query_dcs_data（暂缓）+ investigate_dcs_code（本轮实现）。
+ * 目标架构已达成：query_dcs_data（真实只读数据库）+ investigate_dcs_code（源码调查）。
  *
  * 身份一律来自 ctx.session（DcsToolContext），
  * 工具参数 Schema 中不存在任何身份字段 —— 模型无法指定 employeeNo，
  * 真正查询哪个员工由可信的 DcsToolContext 决定。
  *
- * ★ Legacy 工具（本轮保留、不再扩展，待 query_dcs_data 上线后替换删除）：
- * - check_dcs_permission / query_business_data
+ * ★ Legacy Mock 工具（check_dcs_permission / query_business_data）已于
+ *   2026-09-24 移除（用户授权"直接删掉 mock 部分，用真实数据回复"）：
+ *   真实库验证通过（live:db 4/4）后，所有业务数据查询统一走 query_dcs_data。
  *
- * ★ 数据来源标记（2026-09-22 用户授权）：
- * - 菜单表 / 报餐订单 / 餐标配置 = TEST DATA（测试数据），仅用于系统集成验证，
- *   不代表真实 DCS 数据，不得伪装为真实查询结果。
- * - 正式上线前替换为真实 DCS 只读数据源；届时只替换本文件的数据访问实现，
- *   正式 Tool 接口（名称/参数/Schema/返回语义）不变。
- *
- * ★ investigate_dcs_code：真实只读实现（方案 v2 §3-§6），
- *   搜索 + 定位 + 上下文融合，取代原 search_dcs_code。
+ * ★ investigate_dcs_code：真实只读实现（方案 v2 §3-§6），搜索 + 定位 + 上下文融合。
+ * ★ query_dcs_data：真实只读数据库查询（query-dcs-data-plan-v1），
+ *   模型自主编写 SELECT；护栏仅防卡死，权限全开放为测试期知情决策（方案 §10）。
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition, ToolOutput } from "../core/types.ts";
 import type { DcsToolContext } from "./session.ts";
+import { getDbClient } from "./db/client.ts";
+import { guardSql } from "./db/guard.ts";
+import { formatQueryResult } from "./db/format.ts";
+import { getDiscoveredSchema } from "./identity.ts";
 
 // ---------------------------------------------------------------------------
-// TEST DATA（测试数据）：菜单表 —— 上线前替换为真实 DCS 菜单权限数据源
-// ---------------------------------------------------------------------------
-
-interface MenuDef {
-  menuName: string;
-  allowedRoles: string[];
-}
-
-const MENUS: MenuDef[] = [
-  { menuName: "报餐管理", allowedRoles: ["普通员工"] },
-  { menuName: "权限管理", allowedRoles: ["系统管理员"] },
-  { menuName: "员工信息查询", allowedRoles: ["普通员工", "HR专员"] },
-  { menuName: "考勤管理", allowedRoles: ["部门助理"] },
-];
-
-// ---------------------------------------------------------------------------
-// TEST DATA（测试数据）：报餐订单 / 餐标 —— 上线前替换为真实 DCS 业务数据源
-// ---------------------------------------------------------------------------
-
-const MEAL_LIMIT_YUAN = 35;
-
-function fmtDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-// ---------------------------------------------------------------------------
-// Legacy 工具 1：check_dcs_permission（TEST DATA，待 query_dcs_data 替换）
-// ---------------------------------------------------------------------------
-
-export interface CheckPermissionArgs {
-  menuName: string;
-}
-
-export const checkDcsPermissionTool: ToolDefinition<CheckPermissionArgs, DcsToolContext> = {
-  name: "check_dcs_permission",
-  label: "DCS菜单权限查询",
-  description:
-    "查询当前员工是否拥有指定 DCS 菜单的访问权限。只能查询当前提问员工本人的权限，不支持查询他人。",
-  parameters: {
-    type: "object",
-    properties: {
-      menuName: {
-        type: "string",
-        description: "菜单名称，例如：报餐管理、权限管理",
-      },
-    },
-    required: ["menuName"],
-  },
-  async execute(args, ctx): Promise<ToolOutput> {
-    const user = ctx.session.user;
-    const menuName = String(args?.menuName ?? "").trim();
-    if (!menuName) {
-      return { output: "缺少菜单名称（menuName），请补充后重试。", isError: true };
-    }
-    // 精确匹配 → 包含匹配 → 未匹配
-    const menu =
-      MENUS.find((m) => m.menuName === menuName) ??
-      MENUS.find(
-        (m) => menuName.includes(m.menuName) || m.menuName.includes(menuName)
-      );
-    if (!menu) {
-      return {
-        output: `未找到菜单「${menuName}」，现有菜单：${MENUS.map((m) => m.menuName).join("、")}。请确认菜单名称。`,
-      };
-    }
-    const hasPermission = user.roles.some((r) => menu.allowedRoles.includes(r));
-    if (hasPermission) {
-      return {
-        output: `员工${user.name}（${user.employeeNo}，${user.department ?? "未知部门"}）拥有「${menu.menuName}」权限。`,
-      };
-    }
-    return {
-      output: `员工${user.name}（${user.employeeNo}）没有「${menu.menuName}」权限，缺少角色「${menu.allowedRoles.join("或")}」，请联系管理员开通。`,
-    };
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Legacy 工具 2：query_business_data（TEST DATA，待 query_dcs_data 替换）
-// ---------------------------------------------------------------------------
-
-export type BusinessDataType = "报餐订单" | "餐标配置";
-
-export interface QueryBusinessDataArgs {
-  dataType: BusinessDataType;
-}
-
-export const queryBusinessDataTool: ToolDefinition<QueryBusinessDataArgs, DcsToolContext> = {
-  name: "query_business_data",
-  label: "DCS业务数据查询",
-  description:
-    "查询当前提问员工的 DCS 业务数据。可查：报餐订单（最近订单、状态、金额、失败原因）、餐标配置。只能查询当前员工本人的数据。",
-  parameters: {
-    type: "object",
-    properties: {
-      dataType: {
-        type: "string",
-        enum: ["报餐订单", "餐标配置"],
-        description: "要查询的业务数据类型",
-      },
-    },
-    required: ["dataType"],
-  },
-  async execute(args, ctx): Promise<ToolOutput> {
-    const user = ctx.session.user;
-    const dataType = args?.dataType;
-    if (dataType === "报餐订单") {
-      if (user.employeeNo !== "10086") {
-        return { output: "当前员工暂无报餐订单。" };
-      }
-      const today = new Date();
-      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const lines = [
-        `订单1：日期 ${fmtDate(today)}，状态：已驳回，金额：42 元，失败原因：超出当日餐标（餐标 ${MEAL_LIMIT_YUAN} 元/人/日，实付 42 元，超出 7 元）。`,
-        `订单2：日期 ${fmtDate(yesterday)}，状态：报餐成功，金额：28 元。`,
-      ];
-      return { output: lines.join("\n") };
-    }
-    if (dataType === "餐标配置") {
-      return {
-        output: `餐标配置：餐标=${MEAL_LIMIT_YUAN} 元/人/日；报餐窗口=工作日 08:00-10:30。`,
-      };
-    }
-    return {
-      output: `不支持的数据类型「${String(dataType)}」，可选：报餐订单、餐标配置。`,
-      isError: true,
-    };
-  },
-};
-
-// ---------------------------------------------------------------------------
-// 工具 3：investigate_dcs_code（方案 v2：搜索 + 定位 + 上下文融合，只读）
+// 工具 1：investigate_dcs_code（方案 v2：搜索 + 定位 + 上下文融合，只读）
 // 取代原 search_dcs_code：模型单次调用即获得命中位置与必要上下文，
 // 需要深入时再次调用同一工具（更具体 query / path 限定 / 更大 contextLines）。
 // ---------------------------------------------------------------------------
@@ -465,9 +331,123 @@ function renderLine(line: string | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
+// 工具 2：query_dcs_data（真实只读数据库查询，query-dcs-data-plan-v1）
+// 模型自主编写 SELECT；护栏仅防卡死（guard），错误透传供模型自修正。
+// 测试期权限全开放为用户知情决策（方案 §10）："只查本人"由 prompt 边界 4
+// 软约束，工具层不强制——上线前按方案 §9 恢复 named query catalog。
+//
+// 2026-09-24 方案A+B（真人测试"我有什么权限" turns=25 toolCalls=52 驱动）：
+// - A：schema 提示动态化——原静态常量在 DCS_DB_SCHEMA 未设时回退登录用户名
+//   （只读账号非表所有者），教模型查的数据字典返回 0 行、示例前缀必报
+//   ORA-00942，等于把模型引向死路（52 次调用大部分花在绕出这条路）。
+//   现改为 getter，复用 identity 链路的自动发现结果。
+// - B：内置常用表数据字典（表名/字段全部来自 DCS 源码实体验证，不虚构），
+//   模型不再需要 ALL_TABLES 试错探索即可直接写 JOIN。
+//   2026-09-24 真机修正：DCS 有两套并行权限表——无 ADM 前缀的
+//   S2_UserRole/S2_Role/S2_RolePermission/S2_Permission 才是员工主权限
+//   （首轮按 ADM 组查询返回 0 行即此原因）；ADM 组为管理模块独立权限。
+// ---------------------------------------------------------------------------
+
+export interface QueryDcsDataArgs {
+  sql: string;
+}
+
+/** ORA 错误信息截断上限（防超长错误堆栈撑爆 ToolResult）。 */
+const MAX_ERROR_CHARS = 500;
+
+/**
+ * 数据字典提示中的表所属 schema（方案A）。
+ * 优先级：DCS_DB_SCHEMA 显式配置 > identity 自动发现结果 > DCS_DB_USER 兜底
+ * （CLI 等未触发身份发现的场景）。description 为 getter，每次构造请求时重算，
+ * 身份链路发现 schema 后提示自动修正。
+ */
+function dbDictOwner(): string {
+  const configured = process.env.DCS_DB_SCHEMA?.trim();
+  if (configured) return configured;
+  const discovered = getDiscoveredSchema();
+  if (discovered) return discovered;
+  return process.env.DCS_DB_USER || "<DCS表所属schema>";
+}
+
+/** query_dcs_data 描述（方案B：常用表数据字典，字段名来自源码实体验证）。 */
+function buildQueryDcsDataDescription(): string {
+  const owner = dbDictOwner();
+  return [
+    "在 DCS 系统数据库（Oracle）中执行只读 SELECT 查询，获取系统真实运行数据（权限、报餐、流程状态等）。你可以自主编写 SQL。",
+    "",
+    `【schema 前缀】业务表属于 schema「${owner}」，查询必须带前缀（如 ${owner}.S2_Employee），裸表名会报 ORA-00942。不确定某表的 schema 时可反查：SELECT OWNER FROM ALL_TABLES WHERE TABLE_NAME = '表名'。`,
+    "",
+    "【常用表速查】（字段为数据库列名）",
+    "- 员工：S2_Employee —— Code 工号、Name 姓名、DeptName 部门、UserId 企微userid、IdCard 身份证、Telephone 电话（含敏感字段，仅限查本人）",
+    "- 权限/菜单（回答我有什么权限/角色类问题，员工权限主要在这组表）：",
+    "  S2_UserRole：EmpCode(工号)、RoleCode(角色Code)",
+    "  S2_Role：Code、Name(角色名)、RoleType(所属系统分类)",
+    "  S2_RolePermission：RoleCode、PermissionId(功能Id)",
+    "  S2_Permission：Id、PId(上级)、Name(功能名)、Url",
+    `  查某工号权限示例：SELECT r.Name AS 角色, p.Name AS 功能 FROM ${owner}.S2_UserRole ur JOIN ${owner}.S2_Role r ON r.Code = ur.RoleCode LEFT JOIN ${owner}.S2_RolePermission rp ON rp.RoleCode = ur.RoleCode LEFT JOIN ${owner}.S2_Permission p ON p.Id = rp.PermissionId WHERE ur.EmpCode = '工号'`,
+    "  权限较多时（数百角色×功能）建议先聚合统计（如按角色 GROUP BY 计数）或加 WHERE 过滤，避免 JOIN 结果被行数上限截断。",
+    "  另有一组 S2_ADMUserRole / S2_ADMRole / S2_ADMRolePermission / S2_ADMPermission / S2_ADMMenu 是 ADM 管理模块的独立权限，普通员工通常无记录——查个人权限优先用上面无 ADM 前缀的表。",
+    "",
+    `【找其他表】查表名：SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = '${owner}' AND TABLE_NAME LIKE '%关键字%'；查列名：SELECT TABLE_NAME, COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = '${owner}' AND TABLE_NAME LIKE '%关键字%'（数据字典视图 ALL_TABLES / ALL_TAB_COLUMNS 本身不要加 schema 前缀，加了会报 ORA-00942）；也可以先用 investigate_dcs_code 从源码找表名和字段。`,
+    "",
+    "【规则】仅允许单条 SELECT/WITH 语句；查询出错时错误信息会返回给你，可据此修正 SQL 后重试。",
+  ].join("\n");
+}
+
+export const queryDcsDataTool: ToolDefinition<QueryDcsDataArgs, DcsToolContext> = {
+  name: "query_dcs_data",
+  label: "DCS数据库查询",
+  // 方案A：getter 每次读取时重算——身份链路发现 schema 后提示自动修正
+  get description() {
+    return buildQueryDcsDataDescription();
+  },
+  parameters: {
+    type: "object",
+    properties: {
+      sql: {
+        type: "string",
+        description:
+          "要执行的只读 SQL（单条 SELECT 或 WITH 语句）。查询他人个人数据属于越权，不要执行。",
+      },
+    },
+    required: ["sql"],
+  },
+  async execute(args, _ctx): Promise<ToolOutput> {
+    const sql = String(args?.sql ?? "").trim();
+    if (!sql) {
+      return { output: "缺少 SQL（sql）。", isError: true };
+    }
+
+    // 护栏：仅防卡死与误写（单条只读语句）
+    const guard = guardSql(sql);
+    if (!guard.ok) {
+      return { output: `SQL 被拒绝：${guard.reason}`, isError: false };
+    }
+
+    // 环境变量门控：与 DCS_SOURCE_ROOT 同一模式
+    const client = getDbClient();
+    if (!client) {
+      return {
+        output: "数据库查询能力当前不可用：未配置 DCS_DB_USER / DCS_DB_PASSWORD / DCS_DB_CONNECT_STRING 环境变量。",
+        isError: true,
+      };
+    }
+
+    try {
+      const { columns, rows } = await client.execute(sql);
+      const { output } = formatQueryResult(columns, rows);
+      return { output };
+    } catch (err) {
+      // ORA 错误截断后原样返回模型（供自我修正 SQL 重试）；永不抛异常
+      const msg = String(err instanceof Error ? err.message : err).slice(0, MAX_ERROR_CHARS);
+      return { output: `查询出错（可修正 SQL 后重试）：${msg}`, isError: false };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 
 export const dcsTools: ToolDefinition<any, DcsToolContext>[] = [
-  checkDcsPermissionTool,
-  queryBusinessDataTool,
   investigateDcsCodeTool,
+  queryDcsDataTool,
 ];

@@ -32,7 +32,17 @@ import type {
 import { createDeepSeekStreamFn } from "../src/core/model/deepseek.ts";
 import { maskPii, createDcsToolHooks } from "../src/dcs/hooks.ts";
 import { createMockSession, type DcsToolContext } from "../src/dcs/session.ts";
-import { dcsTools, investigateDcsCodeTool } from "../src/dcs/tools.ts";
+import {
+  dcsTools,
+  investigateDcsCodeTool,
+  queryDcsDataTool,
+} from "../src/dcs/tools.ts";
+import {
+  setDbClientFactoryForTest,
+  type DbClient,
+} from "../src/dcs/db/client.ts";
+import { guardSql } from "../src/dcs/db/guard.ts";
+import { formatQueryResult } from "../src/dcs/db/format.ts";
 import {
   judgeScenario1,
   judgeScenario2,
@@ -134,16 +144,58 @@ function makeAgent<C>(
 const dcsCtx: DcsToolContext = { session: createMockSession() };
 
 // ---------------------------------------------------------------------------
-// 场景 A：权限诊断 —— 只调 check_dcs_permission，Agent 状态写回
+// 假 DbClient（测试注入，不连真库）：按 SQL 关键词返回剧本化数据，
+// 供场景 A/B/G/K 的 Agent 级测试使用（Mock 工具已删除，载体统一为 query_dcs_data；
+// 真实库行为由场景 L 的纯函数/工具级测试与 test/live-db.ts 验证）
 // ---------------------------------------------------------------------------
 
-section("A. 权限诊断（check_dcs_permission → 无权限 → 最终回答）");
+const makeFakeClient = (
+  impl: (sql: string) => Promise<{ columns: string[]; rows: unknown[][] }>
+): DbClient => ({
+  async execute(sql) {
+    return impl(sql);
+  },
+  async close() {},
+});
+
+/** 按剧本 SQL 关键词返回数据的假库（菜单 / 订单 / 餐标 / 考勤）。 */
+const acceptanceFakeDb = makeFakeClient(async (sql) => {
+  if (sql.includes("权限管理")) {
+    return { columns: ["MENU_NAME", "ALLOWED_ROLE"], rows: [["权限管理", "系统管理员"]] };
+  }
+  if (sql.includes("报餐管理")) {
+    return { columns: ["MENU_NAME", "ALLOWED_ROLE"], rows: [["报餐管理", "普通员工"]] };
+  }
+  if (sql.includes("MEAL_ORDER")) {
+    return { columns: ["订单日期", "状态", "金额", "餐标"], rows: [["2026-09-24", "已驳回", "42", "35"]] };
+  }
+  if (sql.includes("MEAL_CONFIG")) {
+    return { columns: ["餐标"], rows: [["35"]] };
+  }
+  if (sql.includes("ATTENDANCE")) {
+    return { columns: ["打卡时间"], rows: [["08:59"]] };
+  }
+  return { columns: ["结果"], rows: [["（无匹配数据）"]] };
+});
+
+// 场景 A/B/G/K 统一注入假库（覆盖环境变量默认工厂，保证离线确定性）
+setDbClientFactoryForTest(() => acceptanceFakeDb);
+
+// ---------------------------------------------------------------------------
+// 场景 A：权限诊断 —— 只调 query_dcs_data，Agent 状态写回
+// ---------------------------------------------------------------------------
+
+section("A. 权限诊断（query_dcs_data → 无权限 → 最终回答）");
 
 {
   const { streamFn, requests } = createFakeStreamFn([
     {
       toolCalls: [
-        { name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' },
+        {
+          name: "query_dcs_data",
+          arguments:
+            '{"sql":"SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = \'权限管理\'"}',
+        },
       ],
     },
     { text: "你缺少系统管理员角色，请联系管理员开通。" },
@@ -159,9 +211,9 @@ section("A. 权限诊断（check_dcs_permission → 无权限 → 最终回答�
   check("A2 Agent.context 写回 4 条消息（user/assistant/toolResult/assistant）", agent.context.length === 4, `实际 ${agent.context.length}`);
   check("A3 首条为 UserMessage", agent.context[0]?.role === "user" && (agent.context[0] as { content: string }).content === "为什么我没有权限管理菜单");
   const a1 = agent.context[1] as AssistantMessage;
-  check("A4 第二条为带 toolCalls 的 AssistantMessage", a1?.role === "assistant" && a1.toolCalls?.length === 1 && a1.toolCalls[0].name === "check_dcs_permission");
+  check("A4 第二条为带 toolCalls 的 AssistantMessage", a1?.role === "assistant" && a1.toolCalls?.length === 1 && a1.toolCalls[0].name === "query_dcs_data");
   const tr = agent.context[2];
-  check("A5 第三条为 ToolResult 且无权限结论正确", tr?.role === "toolResult" && (tr as { content: string }).content.includes("缺少角色「系统管理员」"));
+  check("A5 第三条为 ToolResult 且查询结果含权限数据", tr?.role === "toolResult" && (tr as { content: string }).content.includes("权限管理") && (tr as { content: string }).content.includes("系统管理员"));
   check("A6 ToolResult.toolCallId 与 ToolCall.id 对应", tr?.role === "toolResult" && (tr as { toolCallId: string }).toolCallId === a1.toolCalls?.[0]?.id);
   const a2 = agent.context[3] as AssistantMessage;
   check("A7 末条为最终 AssistantMessage（stop）", a2?.role === "assistant" && a2.stopReason === "stop");
@@ -199,15 +251,27 @@ section("A. 权限诊断（check_dcs_permission → 无权限 → 最终回答�
 }
 
 // ---------------------------------------------------------------------------
-// 场景 B：多轮循环 —— 权限(有) → 业务数据 → 最终回答（完整报餐诊断链）
+// 场景 B：多轮循环 —— 菜单权限 → 报餐订单 → 最终回答（完整诊断链）
 // ---------------------------------------------------------------------------
 
-section("B. 报餐诊断链（check_dcs_permission(有) → query_business_data → 最终回答）");
+section("B. 报餐诊断链（query_dcs_data 查菜单 → 查订单 → 最终回答）");
 
 {
   const { streamFn, requests } = createFakeStreamFn([
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
-    { toolCalls: [{ name: "query_business_data", arguments: '{"dataType":"报餐订单"}' }] },
+    {
+      toolCalls: [
+        {
+          name: "query_dcs_data",
+          arguments:
+            '{"sql":"SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = \'报餐管理\'"}',
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        { name: "query_dcs_data", arguments: '{"sql":"SELECT * FROM S2_MEAL_ORDER ORDER BY 订单日期 DESC"}' },
+      ],
+    },
     { text: "你今天的报餐订单被驳回了：超出当日餐标 7 元（餐标 35 元，实付 42 元）。请修改金额后重新提交。" },
   ]);
 
@@ -215,9 +279,9 @@ section("B. 报餐诊断链（check_dcs_permission(有) → query_business_data 
   const finalText = await agent.prompt("我为什么报不了餐");
 
   check("B1 两轮工具调用全部执行（LLM→Tool→LLM→Tool→LLM 三 Turn 循环）", requests.length === 3, `实际 LLM 调用 ${requests.length} 次`);
-  check("B2 第二轮 LLM 输入含第一轮 ToolResult（有权限）",
-    requests[1]?.messages.some((m) => m.role === "toolResult" && (m as { content: string }).content.includes("拥有「报餐管理」权限")));
-  check("B3 第三轮 LLM 输入含业务数据 ToolResult（超餐标驳回）",
+  check("B2 第二轮 LLM 输入含第一轮 ToolResult（菜单权限数据）",
+    requests[1]?.messages.some((m) => m.role === "toolResult" && (m as { content: string }).content.includes("报餐管理")));
+  check("B3 第三轮 LLM 输入含订单 ToolResult（已驳回 + 42/35）",
     requests[2]?.messages.some((m) => m.role === "toolResult" && (m as { content: string }).content.includes("已驳回")));
   check("B4 Agent.context 共 6 条消息（u/a/tr/a/tr/a）", agent.context.length === 6, `实际 ${agent.context.length}`);
   check("B5 最终回答包含超餐标结论", finalText.includes("超出当日餐标"));
@@ -514,9 +578,9 @@ section("G. 停止策略（maxTurns 用尽 / StreamFn error 契约）");
 {
   // G1: maxTurns 用尽
   const loopForever: TurnPlan[] = [
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }] },
   ];
   const { streamFn, requests } = createFakeStreamFn(loopForever);
   const agent = makeAgent(streamFn, dcsTools, dcsCtx, undefined, 2);
@@ -682,7 +746,7 @@ section("I. length 截断（F2 回归：残缺 toolCalls 不入历史、序列�
 {
   const { streamFn } = createFakeStreamFn([
     {
-      toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuNa' }],
+      toolCalls: [{ name: "query_dcs_data", arguments: '{"sq' }],
       stopReason: "length",
       text: "我先查一下",
     },
@@ -720,7 +784,7 @@ section("I. length 截断（F2 回归：残缺 toolCalls 不入历史、序列�
 {
   // stop 收尾时同样剥离（模型异常输出 tool 片段 + finish:stop）
   const { streamFn } = createFakeStreamFn([
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }], stopReason: "stop", text: "直接回答" },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }], stopReason: "stop", text: "直接回答" },
   ]);
   const agent = makeAgent(streamFn, dcsTools, dcsCtx);
   await agent.prompt("测试");
@@ -774,7 +838,7 @@ section("J. Hook 异常路径（F6 回归：afterToolCall 失败不泄原文 / b
 {
   // J4: beforeToolCall 抛错 → 按阻止处理，prompt 不 reject、消息写回、agent_end 发射
   const { streamFn } = createFakeStreamFn([
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }] },
     { text: "本次查询已被安全策略阻止。" },
   ]);
   const agent = makeAgent(streamFn, dcsTools, dcsCtx, {
@@ -803,8 +867,8 @@ section("J. Hook 异常路径（F6 回归：afterToolCall 失败不泄原文 / b
 
 // ---------------------------------------------------------------------------
 // 场景 K：验收判定对抗（R1 回归）
-// 复刻 audit/revision-fixture.mjs 的 invalid-acceptance 模式：
-// 错误回复文字包含全部关键词、查错菜单、传无效 dataType——判定必须 FAIL
+// Mock 工具删除后，判定器核对 query_dcs_data 的执行与证据：
+// 错误回复文字包含全部关键词、查错数据（考勤≠报餐）——判定必须 FAIL
 // ---------------------------------------------------------------------------
 
 section("K. 验收判定对抗（R1 回归：错误字符串命中关键词必须 FAIL）");
@@ -841,23 +905,37 @@ async function runThreeQuestions(plans: TurnPlan[]): Promise<{ qes: QEvents[]; r
 }
 
 {
-  // K1: 正常剧本（与 revision-fixture 的 valid-acceptance 等价）→ 三问判定全部通过
+  // K1: 正常剧本 → 三问判定全部通过
   const valid = await runThreeQuestions([
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' }] },
+    {
+      toolCalls: [
+        {
+          name: "query_dcs_data",
+          arguments:
+            '{"sql":"SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = \'权限管理\'"}',
+        },
+      ],
+    },
     { text: "你缺少系统管理员角色，请联系管理员开通。" },
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"报餐管理"}' }] },
-    { toolCalls: [{ name: "query_business_data", arguments: '{"dataType":"报餐订单"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT * FROM S2_MEAL_ORDER ORDER BY 订单日期 DESC"}' }] },
     { text: "订单42元，餐标35元，超出7元被驳回。" },
     { text: "餐标是35元/人/日。" },
   ]);
   check("K1 正常剧本三问判定全部 PASS", judgeScenario1(valid.qes[0], valid.replies[0]).ok && judgeScenario2(valid.qes[1], valid.replies[1]).ok && judgeScenario3(valid.qes[2], valid.replies[2]).ok);
 
-  // K2–K4: 对抗剧本（与 revision-fixture 的 invalid-acceptance 等价）→ 全部必须 FAIL
+  // K2–K4: 对抗剧本 → 全部必须 FAIL
   const invalid = await runThreeQuestions([
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' }] },
+    {
+      toolCalls: [
+        {
+          name: "query_dcs_data",
+          arguments:
+            '{"sql":"SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = \'权限管理\'"}',
+        },
+      ],
+    },
     { stopReason: "error", errorMessage: "系统管理员请联系开通" },
-    { toolCalls: [{ name: "check_dcs_permission", arguments: '{"menuName":"权限管理"}' }] },
-    { toolCalls: [{ name: "query_business_data", arguments: '{"dataType":"无效类型"}' }] },
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT * FROM S2_ATTENDANCE WHERE 打卡日期 = SYSDATE"}' }] },
     { stopReason: "error", errorMessage: "驳回超出42元35元" },
     { stopReason: "error", errorMessage: "35" },
   ]);
@@ -869,10 +947,9 @@ async function runThreeQuestions(plans: TurnPlan[]): Promise<{ qes: QEvents[]; r
   );
   const j2 = judgeScenario2(invalid.qes[1], invalid.replies[1]);
   check(
-    "K3 查错菜单（权限管理≠报餐管理）+ 无效 dataType + 错误回复含 42/35/驳回 也必须 FAIL",
+    "K3 查错数据（考勤≠报餐订单）+ 错误回复含 42/35/驳回 也必须 FAIL",
     j2.ok === false &&
-      j2.failures.some((f) => f.includes("报餐管理")) &&
-      j2.failures.some((f) => f.includes("报餐订单")) &&
+      j2.failures.some((f) => f.includes("报餐")) &&
       invalid.replies[1].includes("42") && invalid.replies[1].includes("35") && invalid.replies[1].includes("驳回"),
     j2.failures.join("; ")
   );
@@ -882,6 +959,125 @@ async function runThreeQuestions(plans: TurnPlan[]): Promise<{ qes: QEvents[]; r
     j3.ok === false && invalid.replies[2].includes("35"),
     j3.failures.join("; ")
   );
+}
+
+// ---------------------------------------------------------------------------
+// 场景 L：query_dcs_data（query-dcs-data-plan-v1：假 DbClient，无需真库）
+// ---------------------------------------------------------------------------
+
+section("L. query_dcs_data 数据库查询（护栏 / 格式化 / 错误透传 / 门控 / 脱敏链路）");
+
+{
+  // makeFakeClient 已提升至文件顶部（与场景 A/B/G/K 共享）；
+  // 本场景逐项覆写工厂，结束时恢复默认。
+
+  // ---- L1 guardSql 纯函数 ----
+  check("L1 guard：SELECT / WITH 通过", guardSql("SELECT * FROM DUAL").ok && guardSql("WITH t AS (SELECT 1 FROM DUAL) SELECT * FROM t").ok);
+  check("L2 guard：DELETE / UPDATE / INSERT / DDL 拒绝", !guardSql("DELETE FROM t").ok && !guardSql("UPDATE t SET a=1").ok && !guardSql("INSERT INTO t VALUES (1)").ok && !guardSql("DROP TABLE t").ok);
+  check(
+    "L3 guard：多语句拒绝；注释内分号与尾分号不影响合法单语句",
+    !guardSql("SELECT 1 FROM DUAL; SELECT 2 FROM DUAL").ok &&
+      guardSql("SELECT 1 /* ; */ FROM DUAL").ok &&
+      guardSql("SELECT 1 FROM DUAL;").ok
+  );
+  check("L4 guard：FOR UPDATE 拒绝", !guardSql("SELECT * FROM t FOR UPDATE").ok);
+  check("L5 guard：空 SQL 拒绝", !guardSql("   ").ok);
+
+  // ---- L6-L7 正常查询与截断（工具 execute + 假 client）----
+  setDbClientFactoryForTest(() =>
+    makeFakeClient(async () => ({
+      columns: ["EMPLOYEE_NO", "STATUS"],
+      rows: [
+        ["T000001", "在职"],
+        ["T000002", null],
+        ["T000003", "离职"],
+      ],
+    }))
+  );
+  const ok = await queryDcsDataTool.execute({ sql: "SELECT EMPLOYEE_NO, STATUS FROM S2_Employee" }, dcsCtx);
+  check(
+    "L6 正常查询：行数说明 + 列头 + 行数据 + NULL 渲染",
+    !ok.isError && ok.output.includes("返回 3 行") && ok.output.includes("EMPLOYEE_NO | STATUS") && ok.output.includes("T000002 | NULL"),
+    ok.output
+  );
+
+  setDbClientFactoryForTest(() =>
+    makeFakeClient(async () => ({
+      columns: ["ID"],
+      rows: Array.from({ length: 105 }, (_, i) => [i + 1]),
+    }))
+  );
+  const truncated = await queryDcsDataTool.execute({ sql: "SELECT ID FROM BIG_TABLE" }, dcsCtx);
+  check(
+    "L7 超 100 行截断并提示加 WHERE 收窄",
+    truncated.output.includes("已截断至前 100 行") && truncated.output.includes("WHERE"),
+    truncated.output.slice(0, 120)
+  );
+
+  // ---- L8 非 SELECT 经工具层拒绝 ----
+  const rejected = await queryDcsDataTool.execute({ sql: "DELETE FROM S2_Employee" }, dcsCtx);
+  check(
+    "L8 非 SELECT 经工具层拒绝（返回修正提示，非异常）",
+    !rejected.isError && rejected.output.includes("SQL 被拒绝") && rejected.output.includes("SELECT"),
+    rejected.output
+  );
+
+  // ---- L9 ORA 错误透传（供模型自修正）----
+  setDbClientFactoryForTest(() =>
+    makeFakeClient(async () => {
+      throw new Error("ORA-00942: table or view does not exist");
+    })
+  );
+  const oraErr = await queryDcsDataTool.execute({ sql: "SELECT * FROM NOT_EXIST_TABLE" }, dcsCtx);
+  check(
+    "L9 ORA 错误截断透传（含错误码与重试提示，永不抛异常）",
+    !oraErr.isError && oraErr.output.includes("ORA-00942") && oraErr.output.includes("可修正 SQL 后重试"),
+    oraErr.output
+  );
+
+  // ---- L10 未配置数据库 → 能力不可用 ----
+  setDbClientFactoryForTest(() => null);
+  const unavailable = await queryDcsDataTool.execute({ sql: "SELECT 1 FROM DUAL" }, dcsCtx);
+  check(
+    "L10 未配置 DCS_DB_* 时明确返回能力不可用（isError）",
+    unavailable.isError === true && unavailable.output.includes("不可用") && unavailable.output.includes("DCS_DB_USER"),
+    unavailable.output
+  );
+
+  // ---- L11 maskPii 链路：DB 结果中的手机号进入模型前脱敏 ----
+  setDbClientFactoryForTest(() =>
+    makeFakeClient(async () => ({
+      columns: ["NAME", "PHONE"],
+      rows: [["张三", "13812345678"]],
+    }))
+  );
+  const { streamFn: sfDb, requests: reqDb } = createFakeStreamFn([
+    { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT NAME, PHONE FROM S2_Employee WHERE ..."}' }] },
+    { text: "查询完成，联系方式已脱敏展示。" },
+  ]);
+  const agentDb = makeAgent(sfDb, dcsTools, dcsCtx, createDcsToolHooks());
+  await agentDb.prompt("查一下我的联系方式");
+  const dbTr = reqDb[1]?.messages.find((m) => m.role === "toolResult") as { content: string } | undefined;
+  check(
+    "L11 DB 查询结果进入模型前手机号已脱敏（maskPii 管线对 DB 工具生效）",
+    dbTr?.content.includes("138****5678") === true && dbTr.content.includes("13812345678") === false,
+    dbTr?.content?.slice(0, 200)
+  );
+
+  // ---- L12 format 纯函数：60KB 体积保险 ----
+  // 注：单元格超 200 字符会先被 MAX_CELL_CHARS 截断，单列构造永远达不到 60KB；
+  // 需用多列宽行（50 行 × 10 列 × 200 字符 ≈ 100KB）才能真实触发体积保险。
+  const wideCols = Array.from({ length: 10 }, (_, i) => `C${i + 1}`);
+  const wideRows = Array.from({ length: 50 }, () => wideCols.map(() => "X".repeat(200)));
+  const wide = formatQueryResult(wideCols, wideRows);
+  check(
+    "L12 输出体积达 60KB 上限时截断并注明",
+    wide.truncated && wide.output.includes("已截断") && wide.output.length <= 60 * 1024 + 100,
+    `${wide.output.length} (truncated=${wide.truncated})`
+  );
+
+  // 恢复默认工厂，避免影响其他测试
+  setDbClientFactoryForTest(null);
 }
 
 // ---------------------------------------------------------------------------

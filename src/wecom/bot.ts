@@ -21,21 +21,28 @@ import type { TextMessage, WsFrame } from "@wecom/aibot-node-sdk";
 import { Agent } from "../core/agent.ts";
 import { createDeepSeekStreamFn } from "../core/model/deepseek.ts";
 import { createDcsToolHooks } from "../dcs/hooks.ts";
-import { resolveIdentity } from "../dcs/identity.ts";
+import { resolveIdentityAsync, type DcsIdentity } from "../dcs/identity.ts";
 import { buildSystemPrompt } from "../dcs/prompt.ts";
 import { createSession, type DcsToolContext } from "../dcs/session.ts";
 import { dcsTools } from "../dcs/tools.ts";
+import { closeDbClient } from "../dcs/db/client.ts";
 import { AgentRunner, type UserAgentSlot } from "./agent-runner.ts";
-import {
-  BUSY_PROMPT,
-  CONFIRM_PROMPT,
-  ConversationManager,
-} from "./conversation.ts";
+import { BUSY_PROMPT, ConversationManager } from "./conversation.ts";
 import { MsgIdDedup } from "./dedup.ts";
 
 const UNKNOWN_IDENTITY_REPLY =
   "暂时无法识别您的 DCS 员工身份，请联系管理员。";
 const GROUP_CHAT_REPLY = "暂时仅支持单聊咨询，请在单聊中与我对话。";
+
+/**
+ * 工具调用参数摘要（单行化 + 截断），用于测试期观测日志。
+ * 只进本地控制台，不进入员工可见的企微回复。
+ */
+function summarizeToolArgs(args: unknown): string {
+  const s = JSON.stringify(args) ?? "";
+  const collapsed = s.replace(/\s+/g, " ");
+  return collapsed.length > 160 ? `${collapsed.slice(0, 160)}…` : collapsed;
+}
 
 interface UserAgentEntry {
   agent: Agent<DcsToolContext>;
@@ -43,6 +50,12 @@ interface UserAgentEntry {
   /** 每 Run 统计（方案 v2 §9：观察真实 Case 的 Loop 深度，非生产观测系统）。 */
   stats: { turns: number; toolCalls: number };
 }
+
+/**
+ * 消息入口已解析的身份（两级链路：identity.json 覆盖 → S2_Employee 数据库）。
+ * getSlot 为同步接口（AgentRunner 契约），异步解析结果在此暂存。
+ */
+const resolvedIdentities = new Map<string, DcsIdentity>();
 
 async function main(): Promise<void> {
   const botId = process.env.WECOM_BOT_ID ?? "";
@@ -68,7 +81,7 @@ async function main(): Promise<void> {
   function getSlot(userId: string): UserAgentSlot {
     let entry = agents.get(userId);
     if (!entry) {
-      const identity = resolveIdentity(userId);
+      const identity = resolvedIdentities.get(userId);
       if (!identity) {
         // bot 入口已在消息层做过身份校验，这里理论上不可达；防御性兜底
         throw new Error(`未登记用户 ${userId}`);
@@ -90,13 +103,28 @@ async function main(): Promise<void> {
         maxTurns: 24,
       });
       // 简单统计：每轮 AssistantMessage 计 1 turn，每次工具完成计 1 toolCall
+      // 工具级观测日志（2026-09-24 方案C）：→ 打印调用的工具与参数（SQL 等），
+      // ← 打印耗时与结果摘要——区分"没查对表"与"真没有数据"全靠它
+      const toolTimings = new Map<string, number>();
       agent.subscribe((e) => {
         if (e.type === "assistant_message") stats.turns++;
-        else if (e.type === "tool_execution_end") stats.toolCalls++;
+        else if (e.type === "tool_execution_start") {
+          toolTimings.set(e.toolCallId, Date.now());
+          console.log(`[tool] → ${e.toolName} ${summarizeToolArgs(e.args)}`);
+        } else if (e.type === "tool_execution_end") {
+          stats.toolCalls++;
+          const startedAt = toolTimings.get(e.toolCallId);
+          toolTimings.delete(e.toolCallId);
+          const ms = startedAt !== undefined ? Date.now() - startedAt : -1;
+          console.log(`[tool] ← ${e.toolName}（${ms}ms${e.isError ? "，出错" : ""}）：${e.summary}`);
+        }
       });
       entry = { agent, controller: holder.controller, stats };
       agents.set(userId, entry);
-      console.log(`[bot] 已为用户 ${userId} 创建 Agent（${identity.name}/${identity.employeeNo}，TEST DATA 身份）`);
+      console.log(
+        `[bot] 已为用户 ${userId} 创建 Agent（${identity.name}/${identity.employeeNo}` +
+          `${identity.department ? `，${identity.department}` : ""}）`
+      );
     }
     return entry;
   }
@@ -126,7 +154,6 @@ async function main(): Promise<void> {
   // ---- 会话状态机（Step 5/6）----
   const manager = new ConversationManager({
     actions: {
-      askConfirm: (token) => replyText(token, CONFIRM_PROMPT),
       notifyBusy: (token) => replyText(token, BUSY_PROMPT),
       runAgent: async (userId, question, token) => {
         // 方案 v2 §9：每 Run 记录 turns / toolCalls（简单日志，Run 结束打印）
@@ -175,13 +202,15 @@ async function main(): Promise<void> {
       return;
     }
 
-    // 身份解析：未登记 → 中性拒答（不默认映射、不进入 Agent）
-    const identity = resolveIdentity(userid);
+    // 身份解析（两级链路：identity.json 覆盖 → S2_Employee 数据库）：
+    // 未识别 → 中性拒答（不默认映射、不进入 Agent）
+    const identity = await resolveIdentityAsync(userid);
     if (!identity) {
-      console.log(`[bot] 未登记用户 ${userid}，拒答`);
+      console.log(`[bot] 未识别用户 ${userid}，拒答`);
       await replyText(frame, UNKNOWN_IDENTITY_REPLY).catch((e) => console.error(`[bot] 回复失败：${String(e)}`));
       return;
     }
+    resolvedIdentities.set(userid, identity);
 
     // 空文本（理论上不会出现）忽略
     if (content.trim().length === 0) return;
@@ -208,11 +237,14 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => {
     console.log("\n[bot] 收到退出信号，断开连接…");
     client.disconnect();
-    process.exit(0);
+    // 先关 DB 连接池再退出（未配置数据库时为 no-op），避免连接暴断
+    void closeDbClient()
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
   });
 
   console.log(`[bot] DCS Agent 企业微信机器人启动中…（Agent 预算 ${budgetMs}ms）`);
-  console.log("[bot] 身份数据来源：identity.json（TEST DATA，上线前替换为真实 DCS 身份）");
+  console.log("[bot] 身份链路：identity.json 手动覆盖（可选）→ S2_Employee 数据库解析（仅在职）");
   client.connect();
 }
 

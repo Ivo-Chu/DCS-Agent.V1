@@ -17,7 +17,7 @@ globalThis.fetch = async () => {
   const i = call++;
   let body;
   if (mode === "length") {
-    body = tool("check_dcs_permission", { menuName: "报餐管理" }, "length");
+    body = tool("query_dcs_data", { sql: "SELECT 1 FROM DUAL" }, "length");
   } else {
     // args 模式
     body =

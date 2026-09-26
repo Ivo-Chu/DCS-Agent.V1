@@ -1,6 +1,8 @@
 # Review v6 — 能力释放原则下的 Agent 设计复审
 
-> ⚠️ **状态：已实施，部分结论被后续方案修订**（2026-09-23）。落地建议中的 list_my_menus、独立 read_dcs_file、maxTurns=16、DCS_SOURCE_ROOT 默认值等已被 **docs/tool-convergence-plan-v2.md** 取代（Tool 收敛为 query_dcs_data + investigate_dcs_code）；本文的诊断部分（测试暴露的问题与根因定位）仍然有效。实施结果见 README §9.3。
+> ⛔ 本文档为设计复审档案，落地建议中的 list_my_menus、独立 read_dcs_file、maxTurns=16、DCS_SOURCE_ROOT 默认值等已被 docs/tool-convergence-plan-v2.md 取代，勿作为实施依据。
+> 状态：存档（部分结论被修订） · 日期：2026-09-23
+> 备注：诊断部分（测试暴露的问题与根因定位）仍然有效；实施结果见 README §9.3。
 
 > 2026-09-23 · 依据用户当日拍板的新设计原则（测试阶段最大限度释放模型能力，按真实失败案例逐步加约束）
 > 性质：设计复审，**未修改任何代码**。P0 实施（review 前一轮方案）暂停，其结论在新原则下重新评估见 §E。

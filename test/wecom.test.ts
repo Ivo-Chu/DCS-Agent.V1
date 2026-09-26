@@ -6,16 +6,12 @@
  * 运行：npm run test:wecom
  */
 import { AgentRunner, type UserAgentSlot } from "../src/wecom/agent-runner.ts";
-import {
-  CONFIRM_PROMPT,
-  BUSY_PROMPT,
-  ConversationManager,
-  isConfirmText,
-} from "../src/wecom/conversation.ts";
+import { BUSY_PROMPT, ConversationManager } from "../src/wecom/conversation.ts";
 import { MsgIdDedup } from "../src/wecom/dedup.ts";
 import { buildSystemPrompt } from "../src/dcs/prompt.ts";
 import { createMockSession } from "../src/dcs/session.ts";
-import { checkDcsPermissionTool } from "../src/dcs/tools.ts";
+import { queryDcsDataTool } from "../src/dcs/tools.ts";
+import { setDbClientFactoryForTest, type DbClient } from "../src/dcs/db/client.ts";
 
 let passed = 0;
 let failed = 0;
@@ -39,16 +35,13 @@ function section(t: string): void {
 // ---------------------------------------------------------------------------
 
 interface LogEntry {
-  kind: "askConfirm" | "notifyBusy" | "runAgent";
+  kind: "notifyBusy" | "runAgent";
   userId?: string;
   question?: string;
 }
 
 function makeActions(log: LogEntry[], runImpl?: (userId: string, q: string) => Promise<void>) {
   return {
-    async askConfirm(): Promise<void> {
-      log.push({ kind: "askConfirm" });
-    },
     async notifyBusy(): Promise<void> {
       log.push({ kind: "notifyBusy" });
     },
@@ -60,34 +53,25 @@ function makeActions(log: LogEntry[], runImpl?: (userId: string, q: string) => P
 }
 
 // ---------------------------------------------------------------------------
-// 场景 M：输入确认状态机（Step 5）
+// 场景 M：即时处理状态机（2026-09-24 删除输入确认环节后：IDLE→PROCESSING 两态）
 // ---------------------------------------------------------------------------
 
-section("M. 输入确认状态机");
+section("M. 即时处理状态机（消息到达即进入 Agent，无确认环节）");
 
 {
   const log: LogEntry[] = [];
   const mgr = new ConversationManager({ actions: makeActions(log) });
 
-  // M1: IDLE → 首条消息暂存并询问
-  await mgr.handle("u1", "黄石智通已勾选无需协调员", "t1");
-  check("M1 首条消息不进 Agent，触发询问确认", log.length === 1 && log[0].kind === "askConfirm");
-  check("M2 状态进入 COLLECTING 且消息已暂存", mgr.stateOf("u1") === "COLLECTING" && mgr.bufferOf("u1").join() === "黄石智通已勾选无需协调员");
-
-  // M3: 补充消息追加
-  await mgr.handle("u1", "但是离职流程还是显示协调员信息", "t2");
-  check("M3 补充消息仍不进 Agent，再次询问", log.length === 2 && log[1].kind === "askConfirm" && mgr.bufferOf("u1").length === 2);
-
-  // M4: 确认 → 合并完整问题 → runAgent
-  await mgr.handle("u1", "发送完毕", "t3");
+  // M1/M2: 消息到达即进入 Agent，Run 结束回 IDLE
+  await mgr.handle("u1", "黄石智通已勾选无需协调员，为什么离职流程还显示协调员信息", "t1");
   check(
-    "M4 确认后合并完整问题进入 Agent",
-    log.length === 3 && log[2].kind === "runAgent" && log[2].question === "黄石智通已勾选无需协调员，但是离职流程还是显示协调员信息",
-    log[2]?.question
+    "M1 消息到达即作为完整问题进入 Agent（不再询问确认）",
+    log.length === 1 && log[0].kind === "runAgent" && log[0].question === "黄石智通已勾选无需协调员，为什么离职流程还显示协调员信息",
+    JSON.stringify(log)
   );
-  check("M5 Run 结束后回到 IDLE", mgr.stateOf("u1") === "IDLE");
+  check("M2 Run 结束后回到 IDLE", mgr.stateOf("u1") === "IDLE");
 
-  // M6: 处理中的新消息 → busy，不排队
+  // M3-M5: 处理中的新消息 → busy，不排队
   const log2: LogEntry[] = [];
   const releaseBox: { fn: undefined | (() => void) } = { fn: undefined };
   const gate = new Promise<void>((r) => {
@@ -96,22 +80,23 @@ section("M. 输入确认状态机");
   const mgr2 = new ConversationManager({
     actions: makeActions(log2, () => gate),
   });
-  const runP = mgr2.handle("u2", "问题一", "t1"); // 进入 COLLECTING（askConfirm 是同步完成的）
-  await runP;
-  const confirmP = mgr2.handle("u2", "确认", "t2");
-  check("M6 确认后状态为 PROCESSING", mgr2.stateOf("u2") === "PROCESSING");
+  const runP = mgr2.handle("u2", "问题一", "t1");
+  check("M3 Run 期间状态为 PROCESSING", mgr2.stateOf("u2") === "PROCESSING");
   await mgr2.handle("u2", "处理中插进来的话", "t3");
-  check("M7 处理中新消息 → notifyBusy，不进入 Agent", log2.some((e) => e.kind === "notifyBusy") && log2.filter((e) => e.kind === "runAgent").length === 1);
+  check(
+    "M4 处理中新消息 → notifyBusy，不进入 Agent",
+    log2.some((e) => e.kind === "notifyBusy") && log2.filter((e) => e.kind === "runAgent").length === 1
+  );
   releaseBox.fn?.();
-  await confirmP;
-  check("M8 Run 结束回到 IDLE，插话未排队", mgr2.stateOf("u2") === "IDLE" && log2.filter((e) => e.kind === "runAgent").length === 1);
+  await runP;
+  check("M5 Run 结束回到 IDLE，插话未排队", mgr2.stateOf("u2") === "IDLE" && log2.filter((e) => e.kind === "runAgent").length === 1);
 }
 
 // ---------------------------------------------------------------------------
 // 场景 N：多员工会话隔离（Step 6）
 // ---------------------------------------------------------------------------
 
-section("N. 多员工会话隔离");
+section("N. 多员工会话隔离 + 空闲回收");
 
 {
   const log: LogEntry[] = [];
@@ -124,25 +109,26 @@ section("N. 多员工会话隔离");
     onReset: (u) => resets.push(u),
   });
 
-  await mgr.handle("A", "A 的问题前半", "ta1");
+  await mgr.handle("A", "A 的问题", "ta1");
   await mgr.handle("B", "B 的问题", "tb1");
-  check("N1 A、B 各自独立暂存（互不串扰）", mgr.bufferOf("A").join() === "A 的问题前半" && mgr.bufferOf("B").join() === "B 的问题");
+  const aRun = log.find((e) => e.kind === "runAgent" && e.userId === "A") as { question: string } | undefined;
+  const bRun = log.find((e) => e.kind === "runAgent" && e.userId === "B") as { question: string } | undefined;
+  check("N1 A、B 各自独立进入 Agent（互不串扰）", aRun?.question === "A 的问题" && bRun?.question === "B 的问题");
 
-  await mgr.handle("A", "A 的问题后半", "ta2");
-  check("N2 A 追加不影响 B", mgr.bufferOf("A").length === 2 && mgr.bufferOf("B").length === 1);
-
-  await mgr.handle("B", "完毕", "tb2");
-  const bRun = log.find((e) => e.kind === "runAgent" && e.userId === "B");
-  check("N3 B 的问题独立进入 Agent", (bRun as { question: string } | undefined)?.question === "B 的问题");
-
-  // N4: 空闲 30 分钟回收
+  // 空闲回收：A 超时后新消息触发重置（onReset 丢弃 Agent 实例）
   fakeNow += 31 * 60 * 1000;
-  await mgr.handle("A", "新问题", "ta3");
-  check("N4 空闲超阈值后会话重置（旧暂存被清空、onReset 触发）", resets.includes("A") && mgr.bufferOf("A").join() === "新问题");
+  await mgr.handle("A", "新问题", "ta2");
+  check(
+    "N2 空闲超阈值后会话重置（onReset 触发，新问题正常处理）",
+    resets.includes("A") && log.filter((e) => e.kind === "runAgent" && e.userId === "A").length === 2
+  );
 
-  // N5: 未超阈值不回收
-  await mgr.handle("A", "补充", "ta4");
-  check("N5 活跃期间不重置", !resets.includes("A") || resets.filter((r) => r === "A").length === 1);
+  // 未超阈值不回收
+  await mgr.handle("A", "补充问题", "ta3");
+  check(
+    "N3 活跃期间不重置",
+    resets.filter((r) => r === "A").length === 1 && log.filter((e) => e.kind === "runAgent" && e.userId === "A").length === 3
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,22 +258,38 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
 // 场景 Q：确认词与话术卫生（§七 / §十一）
 // ---------------------------------------------------------------------------
 
-section("Q. 确认词与话术卫生");
+section("Q. 话术卫生（确认环节已删除，仅保留忙碌提示与内容卫生）");
 
 {
-  check("Q1 明确确认词识别（发送完毕/完毕/确认）", isConfirmText("发送完毕") && isConfirmText(" 完毕 ") && isConfirmText("确认") && !isConfirmText("还没说完") && !isConfirmText("确认一下还有补充"));
-  check("Q2 确认提示话术与方案 §七一致", CONFIRM_PROMPT.includes("发送完毕") && CONFIRM_PROMPT.includes("请继续发送"));
-  check("Q3 忙碌提示话术与方案 §八一致", BUSY_PROMPT.includes("正在处理中"));
+  check("Q1 忙碌提示话术与方案 §八一致", BUSY_PROMPT.includes("正在处理中"));
 
   // §十一：不出现编造的联系信息
   const prompt = buildSystemPrompt(createMockSession());
-  check("Q4 systemPrompt 无 8888 / IT 服务台", !prompt.includes("8888") && !prompt.includes("IT 服务台"), prompt.slice(0, 80));
+  check("Q2 systemPrompt 无 8888 / IT 服务台", !prompt.includes("8888") && !prompt.includes("IT 服务台"), prompt.slice(0, 80));
 
   const dcsCtx = { session: createMockSession() };
-  const perm = await checkDcsPermissionTool.execute({ menuName: "权限管理" }, dcsCtx);
-  check("Q5 工具输出无 8888 / IT 服务台", !perm.output.includes("8888") && !perm.output.includes("IT 服务台"), perm.output);
-  const permOk = await checkDcsPermissionTool.execute({ menuName: "报餐管理" }, dcsCtx);
-  check("Q6 有权限输出格式正常", permOk.output.includes("拥有") && !permOk.isError);
+  // 假 DbClient（Mock 工具已删除，话术卫生检查改走 query_dcs_data 假库）
+  const fakeDb: DbClient = {
+    async execute(sql) {
+      if (sql.includes("权限管理")) {
+        return { columns: ["MENU_NAME", "ALLOWED_ROLE"], rows: [["权限管理", "系统管理员"]] };
+      }
+      return { columns: ["MENU_NAME", "ALLOWED_ROLE"], rows: [["报餐管理", "普通员工"]] };
+    },
+    async close() {},
+  };
+  setDbClientFactoryForTest(() => fakeDb);
+  const perm = await queryDcsDataTool.execute(
+    { sql: "SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = '权限管理'" },
+    dcsCtx
+  );
+  check("Q3 工具输出无 8888 / IT 服务台", !perm.output.includes("8888") && !perm.output.includes("IT 服务台"), perm.output);
+  const permOk = await queryDcsDataTool.execute(
+    { sql: "SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = '报餐管理'" },
+    dcsCtx
+  );
+  check("Q4 查询输出格式正常", permOk.output.includes("返回 1 行") && !permOk.isError);
+  setDbClientFactoryForTest(null);
 }
 
 console.log(`\n========== Channel 层测试结果 ==========`);

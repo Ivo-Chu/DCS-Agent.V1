@@ -10,6 +10,7 @@ import { createDcsToolHooks } from "./dcs/hooks.ts";
 import { buildSystemPrompt } from "./dcs/prompt.ts";
 import { createMockSession } from "./dcs/session.ts";
 import { dcsTools } from "./dcs/tools.ts";
+import { closeDbClient } from "./dcs/db/client.ts";
 
 /** 内部源码调查工具名（展示层泛化用；完整结果仍回填模型）。 */
 const INTERNAL_SEARCH_TOOL = "investigate_dcs_code";
@@ -105,6 +106,10 @@ async function main(): Promise<void> {
       }
       if (text === "exit" || text === "quit") {
         rl.close();
+        // 关闭 DB 连接池后退出（未配置数据库时为 no-op），否则常驻连接会让进程挂住
+        void closeDbClient()
+          .catch(() => undefined)
+          .finally(() => process.exit(0));
         return;
       }
       process.stdout.write("助手> ");

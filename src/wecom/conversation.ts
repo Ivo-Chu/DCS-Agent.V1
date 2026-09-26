@@ -1,35 +1,28 @@
 /**
- * wecom/conversation.ts — Step 5/6：输入确认状态机 + 多员工会话隔离。
+ * wecom/conversation.ts — 会话管理：即时处理 + 多员工会话隔离 + 空闲回收。
+ *
+ * 2026-09-24 用户决策：删除"输入确认"环节——消息到达即作为完整问题进入
+ * Agent Run，不再要求回复确认词触发（原 IDLE→COLLECTING→PROCESSING 三态
+ * 简化为 IDLE→PROCESSING 两态）。
+ * 知情代价：一条问题拆成多条消息发送时，每条都会被当作独立问题处理。
  *
  * 每个 userid 一条独立会话记录：
- * IDLE        → 收到消息 → 暂存 → 询问是否发送完毕 → COLLECTING
- * COLLECTING  → 继续收到消息 → 追加暂存 → 再次询问
- * COLLECTING  → 明确确认词（发送完毕/完毕/确认）→ 合并为完整问题 → PROCESSING
+ * IDLE        → 收到消息 → 立即进入 Agent Run → PROCESSING
  * PROCESSING  → 收到任何新消息 → 不入 Agent、不排队 → 回复"上一问正在处理中"
  * PROCESSING  → Run 结束 → IDLE
  *
- * 空闲超过 idleMs（默认 30 分钟）→ 会话重置（清空暂存 + 丢弃 Agent 实例）。
+ * 空闲超过 idleMs（默认 30 分钟）→ 会话重置（丢弃 Agent 实例）。
  *
  * 本模块为纯逻辑（不 import WeCom SDK / core / dcs），动作通过
  * ConversationActions 注入，token 为不透明回复句柄（由 Channel 层解释），
  * 因此可用假动作做确定性测试。
  */
 
-export type ConversationState = "IDLE" | "COLLECTING" | "PROCESSING";
+export type ConversationState = "IDLE" | "PROCESSING";
 
-/** 明确确认词（方案 §七：极少量、简单、可控；不做复杂意图识别）。 */
-export const CONFIRM_WORDS = new Set(["发送完毕", "完毕", "确认"]);
-
-export const CONFIRM_PROMPT =
-  "问题描述发送完毕了吗？如果还有补充，请继续发送；发送完毕后请回复确认。";
 export const BUSY_PROMPT = "上一问正在处理中，请稍后。";
 
-/** 多条暂存消息的合并分隔符（方案 §七示例语义）。 */
-const JOINER = "，";
-
 export interface ConversationActions {
-  /** 询问用户是否发送完毕（或继续补充）。 */
-  askConfirm(token: unknown): Promise<void>;
   /** 处理中收到新消息时的提示。 */
   notifyBusy(token: unknown): Promise<void>;
   /**
@@ -41,7 +34,6 @@ export interface ConversationActions {
 
 interface UserRecord {
   state: ConversationState;
-  buffer: string[];
   lastActive: number;
 }
 
@@ -52,10 +44,6 @@ export interface ConversationManagerOptions {
   idleMs?: number;
   /** 会话重置时的回调（Channel 层用它丢弃该用户的 Agent 实例）。 */
   onReset?: (userId: string) => void;
-}
-
-export function isConfirmText(text: string): boolean {
-  return CONFIRM_WORDS.has(text.trim());
 }
 
 export class ConversationManager {
@@ -91,33 +79,21 @@ export class ConversationManager {
       return;
     }
 
-    // 确认发送完毕：合并暂存 → 完整问题 → Agent Run
-    if (rec.state === "COLLECTING" && isConfirmText(text)) {
-      const question = rec.buffer.join(JOINER);
-      rec.buffer = [];
-      rec.state = "PROCESSING";
-      try {
-        await this.actions.runAgent(userId, question, token);
-      } finally {
-        const r = this.records.get(userId);
-        if (r && r.state === "PROCESSING") {
-          r.state = "IDLE";
-          r.lastActive = this.now();
-        }
+    // 空消息忽略（Channel 层已过滤，防御性兜底）
+    const question = text.trim();
+    if (!question) return;
+
+    // 即时处理：消息即完整问题，直接进入 Agent Run
+    rec.state = "PROCESSING";
+    try {
+      await this.actions.runAgent(userId, question, token);
+    } finally {
+      const r = this.records.get(userId);
+      if (r && r.state === "PROCESSING") {
+        r.state = "IDLE";
+        r.lastActive = this.now();
       }
-      return;
     }
-
-    if (rec.state === "IDLE") {
-      rec.state = "COLLECTING";
-      rec.buffer = [text];
-      await this.actions.askConfirm(token);
-      return;
-    }
-
-    // COLLECTING：继续暂存追加
-    rec.buffer.push(text);
-    await this.actions.askConfirm(token);
   }
 
   /** 当前状态（测试 / 观测用）。 */
@@ -125,12 +101,7 @@ export class ConversationManager {
     return this.records.get(userId)?.state ?? null;
   }
 
-  /** 当前暂存内容（测试 / 观测用）。 */
-  bufferOf(userId: string): string[] {
-    return [...(this.records.get(userId)?.buffer ?? [])];
-  }
-
-  /** 重置某用户会话（清空暂存、回 IDLE，并通知 Channel 丢弃 Agent 实例）。 */
+  /** 重置某用户会话（回 IDLE，并通知 Channel 丢弃 Agent 实例）。 */
   reset(userId: string): void {
     this.records.delete(userId);
     this.onReset?.(userId);
@@ -139,7 +110,7 @@ export class ConversationManager {
   private getRecord(userId: string): UserRecord {
     let rec = this.records.get(userId);
     if (!rec) {
-      rec = { state: "IDLE", buffer: [], lastActive: this.now() };
+      rec = { state: "IDLE", lastActive: this.now() };
       this.records.set(userId, rec);
     }
     return rec;
