@@ -18,13 +18,12 @@
  */
 import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 import type { TextMessage, WsFrame } from "@wecom/aibot-node-sdk";
-import { Agent } from "../core/agent.ts";
-import { createDeepSeekStreamFn } from "../core/model/deepseek.ts";
-import { createDcsToolHooks } from "../dcs/hooks.ts";
+import { createDcsAgent, type DcsAgentHolder } from "../dcs/agent-factory.ts";
+import { loadEnvLocal } from "../dcs/env-local.ts";
+
+loadEnvLocal();
 import { resolveIdentityAsync, type DcsIdentity } from "../dcs/identity.ts";
-import { buildSystemPrompt } from "../dcs/prompt.ts";
-import { createSession, type DcsToolContext } from "../dcs/session.ts";
-import { dcsTools } from "../dcs/tools.ts";
+import { createSession } from "../dcs/session.ts";
 import { closeDbClient } from "../dcs/db/client.ts";
 import { AgentRunner, type UserAgentSlot } from "./agent-runner.ts";
 import { BUSY_PROMPT, ConversationManager } from "./conversation.ts";
@@ -44,9 +43,7 @@ function summarizeToolArgs(args: unknown): string {
   return collapsed.length > 160 ? `${collapsed.slice(0, 160)}…` : collapsed;
 }
 
-interface UserAgentEntry {
-  agent: Agent<DcsToolContext>;
-  controller: AbortController;
+interface UserAgentEntry extends UserAgentSlot {
   /** 每 Run 统计（方案 v2 §9：观察真实 Case 的 Loop 深度，非生产观测系统）。 */
   stats: { turns: number; toolCalls: number };
 }
@@ -86,22 +83,13 @@ async function main(): Promise<void> {
         // bot 入口已在消息层做过身份校验，这里理论上不可达；防御性兜底
         throw new Error(`未登记用户 ${userId}`);
       }
-      const holder = { controller: new AbortController() };
+      // holder 是可变对象，工厂组装的 streamFn 与 AgentRunner 替换/abort 的
+      // 是同一个 holder——超时取消能真正到达模型请求（2026-09-28 修复：
+      // 旧实现复制 controller 初始值，替换 entry 后取消信号失效）
+      const holder: DcsAgentHolder = { controller: new AbortController() };
       const stats = { turns: 0, toolCalls: 0 };
       const session = createSession(identity, userId);
-      const agent = new Agent<DcsToolContext>({
-        systemPrompt: buildSystemPrompt(session),
-        tools: dcsTools,
-        // 每用户独立 streamFn，绑定该用户的取消信号持有器；
-        // Run 开始时替换 controller，超时 abort 后旧 Run 无法再发起模型请求
-        streamFn: createDeepSeekStreamFn({
-          signalProvider: () => holder.controller.signal,
-        }),
-        toolContext: { session },
-        hooks: createDcsToolHooks(),
-        // 方案 v2 §9：测试期宽松安全阀（非生产参数）
-        maxTurns: 24,
-      });
+      const agent = createDcsAgent({ session, holder });
       // 简单统计：每轮 AssistantMessage 计 1 turn，每次工具完成计 1 toolCall
       // 工具级观测日志（2026-09-24 方案C）：→ 打印调用的工具与参数（SQL 等），
       // ← 打印耗时与结果摘要——区分"没查对表"与"真没有数据"全靠它
@@ -119,7 +107,7 @@ async function main(): Promise<void> {
           console.log(`[tool] ← ${e.toolName}（${ms}ms${e.isError ? "，出错" : ""}）：${e.summary}`);
         }
       });
-      entry = { agent, controller: holder.controller, stats };
+      entry = { agent, holder, stats };
       agents.set(userId, entry);
       console.log(
         `[bot] 已为用户 ${userId} 创建 Agent（${identity.name}/${identity.employeeNo}` +

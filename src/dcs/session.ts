@@ -30,6 +30,13 @@ export interface DcsSession {
 /** DCS 工具上下文：工具从这里获得当前员工身份，模型无法指定。 */
 export interface DcsToolContext {
   session: DcsSession;
+  /**
+   * 当前 Run 的取消信号持有器（可变对象）——与模型 signalProvider 读取的
+   * 是同一 holder（agent-factory 组装时注入）。工具在执行时读取
+   * holder.controller.signal，Run 超时/用户停止后可中止自己的外部请求
+   * （如知识库检索 HTTP 调用）。可选：离线测试可不传。
+   */
+  holder?: { controller: AbortController };
 }
 
 export function createMockSession(): DcsSession {

@@ -168,7 +168,7 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
         });
       },
     };
-    const slot: UserAgentSlot = { agent, controller: new AbortController() };
+    const slot: UserAgentSlot = { agent, holder: { controller: new AbortController() } };
     return { slot, st };
   }
 
@@ -227,7 +227,7 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
   check("P4 超时后 Run 立即结束（会话可回 IDLE）", true);
   check("P5 超时提示以 finish=true 发送", replies.length === 2 && replies[1].content.includes("超时") && replies[1].finish === true, JSON.stringify(replies));
   check("P6 超时废弃 Agent 实例（防 Context 污染）", discarded.includes("u2") && !slots.has("u2"));
-  check("P7 超时即 abort（旧 Run 无法再发起模型请求）", slot2.controller.signal.aborted === true);
+  check("P7 超时即 abort（旧 Run 无法再发起模型请求）", slot2.holder.controller.signal.aborted === true);
 
   // P8: 迟到结果不进入回复链
   replies.length = 0;
@@ -245,10 +245,10 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
     JSON.stringify(replies)
   );
 
-  // P9: 新 Run 使用新 controller（旧 abort 不影响新 Run）
+  // P9: 新 Run 替换 holder 内的 controller（旧 abort 不影响新 Run）
   const run4 = runner.run("u2", "超时后的新问题", "tok4");
   await tick();
-  check("P9 超时后新 Run 获得全新 Agent 与未中止的 controller", slots.has("u2") && slots.get("u2")!.slot.controller.signal.aborted === false);
+  check("P9 超时后新 Run 获得全新 Agent 与未中止的 controller", slots.has("u2") && slots.get("u2")!.slot.holder.controller.signal.aborted === false);
   slots.get("u2")!.st.resolver?.("新答案");
   await run4;
   check("P10 新 Run 正常完成", replies.some((r) => r.content === "新答案" && r.finish === true));

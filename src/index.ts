@@ -4,12 +4,11 @@
  * DcsSession + DCS Prompt + DCS Tools + DCS Hooks + DeepSeek StreamFn + Agent。
  */
 import * as readline from "node:readline";
-import { Agent } from "./core/agent.ts";
-import { createDeepSeekStreamFn } from "./core/model/deepseek.ts";
-import { createDcsToolHooks } from "./dcs/hooks.ts";
-import { buildSystemPrompt } from "./dcs/prompt.ts";
+import { createDcsAgent } from "./dcs/agent-factory.ts";
+import { loadEnvLocal } from "./dcs/env-local.ts";
+
+loadEnvLocal();
 import { createMockSession } from "./dcs/session.ts";
-import { dcsTools } from "./dcs/tools.ts";
 import { closeDbClient } from "./dcs/db/client.ts";
 
 /** 内部源码调查工具名（展示层泛化用；完整结果仍回填模型）。 */
@@ -23,20 +22,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // DCS Domain Layer 组装
+  // DCS Domain Layer 组装（统一走 agent-factory；CLI 保持默认模拟身份）
   const session = createMockSession();
-  const systemPrompt = buildSystemPrompt(session);
-
-  // Agent Runtime 组装
-  const agent = new Agent({
-    systemPrompt,
-    tools: dcsTools,
-    streamFn: createDeepSeekStreamFn(),
-    toolContext: { session },
-    hooks: createDcsToolHooks(),
-    // 方案 v2 §9：测试期宽松安全阀（非生产参数）
-    maxTurns: 24,
-  });
+  const agent = createDcsAgent({ session, holder: { controller: new AbortController() } });
 
   // R3（审查修复）：统计本轮已流式打印的字符数，
   // prompt() 结束后补打 finalText 中未流式显示过的后缀

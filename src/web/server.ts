@@ -12,7 +12,7 @@
  *   GET  /              静态页（/style.css、/app.js 同目录白名单）
  *   POST /api/session   工号建档 { code } → { token, name, employeeNo, department }
  *   POST /api/chat      SSE 流式问答 { question }（Authorization: Bearer <token>）
- *   POST /api/reset     新会话（丢弃该员工 Agent 实例）
+ *   POST /api/reset     新会话（丢弃该员工 Agent 实例；处理中返回 409 拒绝）
  *
  * 与 wecom 的差异：一次发送即完整问题（无确认状态机）；每员工同时只跑一个 Run
  * （busy 时拒绝新 Run）；90s 预算超时 abort + 丢弃 Agent（与 agent-runner 同口径）。
@@ -30,14 +30,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { Agent } from "../core/agent.ts";
 import type { AgentEvent } from "../core/events.ts";
-import { createDeepSeekStreamFn } from "../core/model/deepseek.ts";
-import { createDcsToolHooks } from "../dcs/hooks.ts";
+import { createDcsAgent } from "../dcs/agent-factory.ts";
+import { loadEnvLocal } from "../dcs/env-local.ts";
+
+loadEnvLocal();
 import { resolveEmployeeByCode, type DcsIdentity } from "../dcs/identity.ts";
-import { buildSystemPrompt } from "../dcs/prompt.ts";
-import { createSession, type DcsToolContext } from "../dcs/session.ts";
-import { dcsTools } from "../dcs/tools.ts";
+import { createSession } from "../dcs/session.ts";
 import { closeDbClient } from "../dcs/db/client.ts";
 
 const DEFAULT_PORT = 8787;
@@ -70,7 +69,8 @@ interface SessionRecord {
 
 interface AgentEntry {
   agent: AgentLike;
-  controller: AbortController;
+  /** 可变取消信号持有器：模型 signalProvider 读取同一对象（复制 controller 引用会使取消失效）。 */
+  holder: { controller: AbortController };
   busy: boolean;
 }
 
@@ -104,23 +104,14 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     deps.createAgent ??
     ((identity: DcsIdentity, holder: { controller: AbortController }): AgentLike => {
       const session = createSession(identity, `web-${identity.employeeNo}`, "web");
-      return new Agent<DcsToolContext>({
-        systemPrompt: buildSystemPrompt(session),
-        tools: dcsTools,
-        streamFn: createDeepSeekStreamFn({
-          signalProvider: () => holder.controller.signal,
-        }),
-        toolContext: { session },
-        hooks: createDcsToolHooks(),
-        maxTurns: 24, // 测试期宽松安全阀（与 bot/CLI 同口径，非生产参数）
-      });
+      return createDcsAgent({ session, holder });
     });
 
   function getEntry(identity: DcsIdentity): AgentEntry {
     let entry = agents.get(identity.employeeNo);
     if (!entry) {
       const holder = { controller: new AbortController() };
-      entry = { agent: createAgent(identity, holder), controller: holder.controller, busy: false };
+      entry = { agent: createAgent(identity, holder), holder, busy: false };
       agents.set(identity.employeeNo, entry);
       log(`[web] 已为 ${identity.name}/${identity.employeeNo} 创建 Agent`);
     }
@@ -129,6 +120,15 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
 
   function discardEntry(employeeNo: string): void {
     if (agents.delete(employeeNo)) log(`[web] 已废弃 ${employeeNo} 的 Agent 实例`);
+  }
+
+  /**
+   * 仅当 Map 中保存的仍是本次运行的实例时才删除（2026-09-28 修复）：
+   * 超时/断开触发的清理是异步回调，期间 Map 可能已被 reset+新 Run 换成
+   * 新实例——旧回调不得误删新实例。
+   */
+  function discardEntryIfCurrent(employeeNo: string, entry: AgentEntry): void {
+    if (agents.get(employeeNo) === entry) discardEntry(employeeNo);
   }
 
   function auth(req: http.IncomingMessage): DcsIdentity | null {
@@ -184,8 +184,9 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       return;
     }
     entry.busy = true;
-    // 新 Run 新控制器：旧 Run 的 aborted signal 不影响新 Run（同 agent-runner）
-    entry.controller = new AbortController();
+    // 新 Run 新控制器：替换 holder 内的 controller（模型 signalProvider 读取
+    // 同一 holder，立即生效）；旧 Run 的 aborted signal 不影响新 Run
+    entry.holder.controller = new AbortController();
 
     let finished = false;
     let timedOut = false;
@@ -213,8 +214,8 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     const timer = setTimeout(() => {
       if (finished) return;
       timedOut = true;
-      entry.controller.abort(); // 中止当前及后续模型请求
-      discardEntry(identity.employeeNo); // 废弃可能被污染的 Agent
+      entry.holder.controller.abort(); // 中止当前及后续模型请求
+      discardEntryIfCurrent(identity.employeeNo, entry); // 废弃可能被污染的 Agent（仅当仍是本实例）
       sseSend(res, { type: "timeout", message: "这次查询超时，请稍后重试。" });
       finish();
     }, budgetMs);
@@ -222,8 +223,8 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     // 前端停止/关闭页面：连接断开即中止 Run（迟到结果无人接收，直接废弃）
     res.on("close", () => {
       if (!finished) {
-        entry.controller.abort();
-        discardEntry(identity.employeeNo);
+        entry.holder.controller.abort();
+        discardEntryIfCurrent(identity.employeeNo, entry);
         finish();
       }
     });
@@ -301,6 +302,14 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
           return;
         }
         if (url === "/api/reset") {
+          // 2026-09-28 修复：处理中重置会与运行结束的清理回调竞争
+          //（旧回调误删新实例 / busy 状态丢失），最小方案是直接拒绝：
+          // busy 时返回 409，保留当前实例与状态，等本 Run 完成后再重置。
+          const current = agents.get(identity.employeeNo);
+          if (current?.busy) {
+            sendJson(res, 409, { ok: false, message: "上一问正在处理中，请完成后再新建会话。" });
+            return;
+          }
           discardEntry(identity.employeeNo);
           sendJson(res, 200, { ok: true });
           return;

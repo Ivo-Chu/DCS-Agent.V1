@@ -5,3 +5,12 @@ dist/
 identity.json
 .vs/
 .workbuddy/
+
+# 真实业务验收案例（含真实工号）与运行报告
+test/acceptance-cases/cases.json
+test/acceptance-cases/reports/
+
+# 知识库资料与本地索引（含向量化数据与导入清单，不入库）
+knowledge/documents/
+data/knowledge/
+.env.local

@@ -1017,8 +1017,8 @@ section("L. query_dcs_data 数据库查询（护栏 / 格式化 / 错误透传 /
   // ---- L8 非 SELECT 经工具层拒绝 ----
   const rejected = await queryDcsDataTool.execute({ sql: "DELETE FROM S2_Employee" }, dcsCtx);
   check(
-    "L8 非 SELECT 经工具层拒绝（返回修正提示，非异常）",
-    !rejected.isError && rejected.output.includes("SQL 被拒绝") && rejected.output.includes("SELECT"),
+    "L8 非 SELECT 经工具层拒绝（isError:true 如实反映失败，返回修正提示，非异常）",
+    rejected.isError === true && rejected.output.includes("SQL 被拒绝") && rejected.output.includes("SELECT"),
     rejected.output
   );
 
@@ -1030,8 +1030,8 @@ section("L. query_dcs_data 数据库查询（护栏 / 格式化 / 错误透传 /
   );
   const oraErr = await queryDcsDataTool.execute({ sql: "SELECT * FROM NOT_EXIST_TABLE" }, dcsCtx);
   check(
-    "L9 ORA 错误截断透传（含错误码与重试提示，永不抛异常）",
-    !oraErr.isError && oraErr.output.includes("ORA-00942") && oraErr.output.includes("可修正 SQL 后重试"),
+    "L9 ORA 错误截断透传且 isError:true（真实失败如实标记，含错误码与重试提示，永不抛异常）",
+    oraErr.isError === true && oraErr.output.includes("ORA-00942") && oraErr.output.includes("可修正 SQL 后重试"),
     oraErr.output
   );
 
@@ -1075,6 +1075,52 @@ section("L. query_dcs_data 数据库查询（护栏 / 格式化 / 错误透传 /
     wide.truncated && wide.output.includes("已截断") && wide.output.length <= 60 * 1024 + 100,
     `${wide.output.length} (truncated=${wide.truncated})`
   );
+
+  // ---- L13 错误→修正→恢复全链路（isError 语义回归）----
+  // 模型第一次 SQL 触发 ORA 错误（isError:true 进入事件与 ToolResult）→
+  // 模型读到错误内容后改写 SQL → 第二次成功 → 正常作答。
+  // 验收口径：中间工具失败 ≠ 运行失败，可恢复错误不得判整题失败。
+  {
+    let callCount = 0;
+    setDbClientFactoryForTest(() =>
+      makeFakeClient(async (sql) => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("ORA-00942: table or view does not exist");
+        }
+        void sql;
+        return { columns: ["NAME", "STATUS"], rows: [["张三", "正常"]] };
+      })
+    );
+    const { streamFn: sfFix, requests: reqFix } = createFakeStreamFn([
+      { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT * FROM WRONG_TABLE"}' }] },
+      { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT NAME, STATUS FROM S2_Employee WHERE Code = \'10086\'"}' }] },
+      { text: "你的状态正常，查询完成。" },
+    ]);
+    const agentFix = makeAgent(sfFix, dcsTools, dcsCtx, createDcsToolHooks());
+    const fixEvents: AgentEvent[] = [];
+    agentFix.subscribe((e) => fixEvents.push(e));
+    const fixReply = await agentFix.prompt("查一下我的状态");
+    const fixToolEnds = fixEvents.filter((e) => e.type === "tool_execution_end") as Extract<AgentEvent, { type: "tool_execution_end" }>[];
+    // 最后一次 LLM 请求的上下文含全部 ToolResult（累积），按序取 [错误结果, 成功结果]
+    const finalReq = reqFix[reqFix.length - 1];
+    const fixToolResults = finalReq?.messages.filter((m) => m.role === "toolResult") as { content: string }[] | undefined;
+    check(
+      "L13a 第一次查询失败：事件与 ToolResult 均标记 isError（如实反映执行结果）",
+      fixToolEnds[0]?.isError === true && fixToolResults?.[0]?.content.includes("ORA-00942") === true,
+      `event.isError=${String(fixToolEnds[0]?.isError)} toolResult=${fixToolResults?.[0]?.content?.slice(0, 80)}`
+    );
+    check(
+      "L13b 模型收到错误后改写 SQL，第二次查询成功（isError:false）",
+      fixToolEnds[1]?.isError === false && fixToolResults?.[1]?.content.includes("正常") === true,
+      `event.isError=${String(fixToolEnds[1]?.isError)} toolResult=${fixToolResults?.[1]?.content?.slice(0, 80)}`
+    );
+    check(
+      "L13c 中间工具失败不终止运行：最终正常作答（可恢复错误 ≠ 运行失败）",
+      fixReply.includes("正常") && fixToolEnds.length === 2,
+      fixReply.slice(0, 80)
+    );
+  }
 
   // 恢复默认工厂，避免影响其他测试
   setDbClientFactoryForTest(null);

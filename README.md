@@ -1,27 +1,21 @@
 # DCS Agent v1 — 功能与技术说明文档
 
 > 状态：**现行（项目唯一现状文档）**；docs/ 为决策历史、audit/ 为修复档案、docs/archive/ 为已废弃方案，冲突时以代码为准（详见 AGENTS.md）
-> 最小可用 Agent Runtime 骨架 + DCS 三场景验证
-> 版本：v1.0.0 · 2026-09-21 · TypeScript / Node 22+ / ESM / 零运行时依赖
+> DCS 员工智能助手：自研轻量 Agent Runtime + 企业微信机器人 / 网页端两个接入通道 + 真实 Oracle 数据查询、本地知识库（LanceDB + 集团 Embedding/Rerank）与 DCS 源码调查三个工具
+> 版本：v1.x · TypeScript / Node 22+ / ESM（运行时依赖：@wecom/aibot-node-sdk、oracledb）
 
 ---
 
 ## 1. 项目定位
 
-自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），并在其上跑通 DCS 的三个业务场景：
-
-| 场景 | 问题示例 | 工具链路 |
-|---|---|---|
-| 菜单权限诊断 | "为什么我没有权限管理菜单" | `check_dcs_permission` |
-| 系统问题诊断（报餐类） | "我为什么报不了餐" | `check_dcs_permission` → `query_business_data` |
-| 功能使用问答（含追问） | "那餐标是多少" | 复用历史上下文，无需工具 |
-
-v1 只验证骨架正确性，核心是证明这条链路成立：
+自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）与**源码调查**（`investigate_dcs_code`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
 
 ```
 User Prompt → Agent → AgentLoop → LLM → ToolCall → Tool Execution
 → ToolResult → LLM → Final Response → newMessages 写回 Agent Context
 ```
+
+身份链路：CLI 默认模拟身份；Web / 企微走真实身份解析（工号建档 / 企微 userid → S2_Employee 数据库解析，仅在职，见 §5.2）。
 
 ---
 
@@ -185,10 +179,11 @@ DcsToolContext（可信，运行时注入）
 
 ---
 
-## 6. 工具清单（当前 2 个，全部真实数据源）
+## 6. 工具清单（当前 3 个，全部真实数据源）
 
 | 工具 | 状态 | 参数 | 数据来源 | 说明 |
 |---|---|---|---|---|
+| `search_dcs_knowledge` | **在用**（2026-09-29 RAG 接入；同日由 RAGFlow 替换为本地实现） | `query`（必填） | **本地知识库**：本地解析分块 → 集团 Embedding（Qwen3-Embedding-8B）→ LanceDB 余弦召回（默认 20 候选）→ 集团 Rerank（Qwen3-Reranker-8B，默认前 5） | 操作手册/制度/FAQ 等文档问答；返回原文片段+文档标题+章节/PDF页码出处；总输出约 8000 字（超出时减少低排名片段）；Rerank 失败降级向量序并注明；Embedding 失败 isError:true（不伪装无资料）；未找到（isError:false）与服务失败严格区分；超时与 Run 取消中止 HTTP；未配置 DCS_EMBEDDING_* 时能力不可用且 systemPrompt 不注入 |
 | `query_dcs_data` | **在用**（方案 docs/query-dcs-data-plan-v1.md） | `sql`（必填） | **真实 Oracle 库**（oracledb Thin 连接池，只读） | 模型自主写 SELECT；护栏：纯函数 guardSql（仅 SELECT/WITH、单语句、拒 FOR UPDATE）+ 100 行截断 + 单元格 200 字符 + 60KB 体积保险；ORA 错误透传供模型自修正；结果统一过 maskPii 脱敏 |
 | `investigate_dcs_code` | **在用**（方案 v2，取代原 search_dcs_code） | `query`（必填）、`path`（可选）、`contextLines`（可选，默认 3 最大 50） | **真实实现**：DCS 源码只读搜索 + 上下文读取 | 命中 ≤15 处，每处返回相对路径 + 行号 + 命中行（> 标记）+ 前后上下文；模型可多次调用逐步深入 |
 
@@ -212,7 +207,42 @@ DcsToolContext（可信，运行时注入）
 - **性能**：进程内文件列表 + 内容缓存（总量 256MB 上限），长驻 bot 首次全量约 10s、同进程后续约 1s；
 - **凭据防线**：ToolResult 统一过 afterToolCall 脱敏（Password/Pwd/Secret/Token/ApiKey/AccessKey 值 → `***`），Web.config 可调查但连接串密码不会进入模型上下文。
 
-**目标架构已落地**：`query_dcs_data`（数据库）+ `investigate_dcs_code`（源码调查），无 Mock 工具。
+### 6.1 本地知识库（search_dcs_knowledge 的后端）
+
+**架构**（2026-09-29 由 RAGFlow 方案替换：取消 Docker / WSL2 / RAGFlow 部署要求，无需任何本地服务部署）：资料导入与检索全部在本地完成，仅向量化与重排序调用集团接口。
+
+```
+导入（npm run knowledge:ingest，可重复执行）：
+本地文档（MD / TXT / DOCX / 可提取文字的 PDF，knowledge/documents/）
+  → 提取正文（mammoth / pdf-parse；扫描版 PDF 与空文档明确报错，.doc 提示转存 .docx）
+  → 结构分块（标题链保留 / 表格重复表头 / 段落 600–1000 字 / 超长句切 + 100 字重叠 / PDF 保留页码）
+  → 集团 Embedding 批量向量化（Qwen3-Embedding-8B；输入=《标题》+章节+正文；首请求探测实际维度，不硬编码）
+  → 本地 LanceDB（data/knowledge/，保存原文、向量、出处与导入清单）
+
+检索（Agent 提问时）：
+问题 → 集团 Embedding → LanceDB 余弦召回（默认 20 候选）
+  → 集团 Rerank 排序（Qwen3-Reranker-8B，默认前 5；输入同 embedding=标题+章节+正文）
+  → 完整原文片段 + 出处（片段正文绝不截断，末尾限制条件保留）→ 现有 Agent 组织答案并引用出处
+```
+
+**导入增量语义**：新文件入库；未变化跳过；已修改文件**原子替换**（先写入新分块、成功后再删旧分块——写入失败时旧版本完整保留仍可检索；删除失败的新版残留由下次导入的孤儿清理移除）；已删除文件同步移除；单文件失败保留此前可用版本。更新前显式校验向量维度与索引一致（不一致拒绝写入并提示重建）。更换 Embedding 模型 / 维度 / 分块规则后索引不兼容——打开时报错要求删除索引目录重建，绝不混用向量。
+
+**DOCX 能力边界**：当前 DOCX 走纯文本提取，不保留 Word 标题层级与表格结构（表格会被摊平为文本行）。普通说明文档可直接试用；**若正式资料以制度表格为主，导入后必须人工核对检索结果**，不能默认"支持 DOCX"等于结构完整。结构化表格建议转存 Markdown 表格后导入。
+
+**使用步骤**：
+
+1. 放资料：`knowledge/documents/`（目录不存在时导入命令自动创建；已 gitignored 不入库；不递归子目录、不扫工作区）
+2. 配置环境变量（见 .env.example 知识库段）：`DCS_EMBEDDING_URL` + `DCS_EMBEDDING_API_KEY` 必填（完整请求 URL，代码不追加路径）；`DCS_RERANK_URL` 可选——未配置时检索降级为向量排序并在结果中注明
+3. 导入：`npm run knowledge:ingest`（失败项退出码 1，成功为 0）
+4. 照常启动：`npm run web`（或 `wecom:bot` / `dev`），无需其他操作
+
+**接口对接口径**：Embedding 按响应 `data[].index` 对位（不假设顺序）、校验数量/维度/数值有效性；Rerank 按 `results[].index` 找回本地候选、校验越界与重复、`top_n` 不超过候选数；两接口均不发送文档中冲突的 `prompt` 字段（按完整请求示例实施）。请求超时覆盖响应正文读取全过程。
+
+**当前已验证状态**：离线全链路 46 项测试通过（真实 LanceDB 临时库 + mock 集团接口：含中文同义检索「取消报餐」→「撤销订餐」、增量同步四态、单文件失败保留、Rerank 降级、请求取消、超时）。**集团真实接口与真实文档导入未验证**（缺接口地址与凭据），见 §9.9。测试文档模板：`test/acceptance-cases/knowledge-testdoc.md`（虚构系统手册 + 5 个验证问题）。
+
+**目标架构已落地**：`search_dcs_knowledge`（知识库）+ `query_dcs_data`（数据库）+ `investigate_dcs_code`（源码调查），无 Mock 工具。
+
+
 
 **不提供 `get_user_info`**：身份已由 DcsSession 提供，不存在模型查询其他员工身份的场景。
 
@@ -225,21 +255,29 @@ DcsToolContext（可信，运行时注入）
 ### 7.1 命令
 
 ```bash
-npm install                  # 安装依赖（typescript / tsx / @types/node / @wecom/aibot-node-sdk）
+npm install                  # 安装依赖（typescript / tsx / @types/* / @wecom/aibot-node-sdk / oracledb）
+npm run check                # 统一离线检查（typecheck + 全部离线测试，任一失败非零退出；不含真实模型/数据库测试）
 npm run typecheck            # tsc --noEmit
-npm test                     # 冒烟测试（92 项，FakeStreamFn + 假 DbClient，无需 key/真库）
-npm run test:accept          # 三验收场景接线验证（FakeStreamFn，无需 key，不证明模型行为）
-npm run test:cli             # CLI 展示层入口级验证（本地假模型，无需 key）
+npm test                     # 冒烟测试（FakeStreamFn + 假 DbClient，无需 key/真库）
+npm run test:accept          # 三验收场景离线接线验证（FakeStreamFn，不证明模型行为）
+npm run test:cli             # CLI 展示层入口级验证（本地假模型）
+npm run test:wecom           # 企微 Channel 层测试（假动作/假 Agent/可控时钟）
+npm run test:web             # Web Channel 层测试（假身份+假 Agent，真实 HTTP）
+npm run test:identity        # 身份链路逻辑测试（临时 fixture，无需真库）
+npm run test:factory         # Agent 组装工厂测试（拦截 fetch 验证取消信号真实接线）
+npm run test:accept:harness  # 真实业务验收 harness 离线测试（案例加载/会话隔离/结果分类）
+npm run test:knowledge      # 知识库全链路测试（真实 LanceDB 临时库 + mock 集团接口，无需配置）
+npm run knowledge:ingest    # 知识库资料导入/更新（需 DCS_EMBEDDING_*，见 §6.1）
 npm run test:live            # DeepSeek 真实 key 适配器单测（需 DEEPSEEK_API_KEY）
-npm run test:live:db         # 真实 Oracle 库验证 L-DB1~4（需 DCS_DB_* 三变量，未配置优雅 SKIPPED）
-npm run test:accept:live     # 真实 DeepSeek 三问验收（需 DEEPSEEK_API_KEY）
-npm run dev                  # CLI REPL（需 DEEPSEEK_API_KEY）
-npm run wecom:echo           # 企业微信长连接 Echo（Step 1，需 WECOM_BOT_ID / WECOM_BOT_SECRET）
-npm run web                  # 网页端（Web Channel，需 DEEPSEEK_API_KEY + DCS_DB_*，见 §7.2.2）
-npm run test:web             # Web Channel 层测试（15 项，假身份+假 Agent，无需 key/真库）
+npm run test:live:db         # 真实 Oracle 库验证（需 DCS_DB_* 三变量，未配置优雅 SKIPPED）
+npm run test:accept:live     # 真实业务验收（真实员工身份 + 真实库 + 真实模型，案例驱动，见 §7.5）
+npm run dev                  # CLI REPL（需 DEEPSEEK_API_KEY；默认模拟身份）
+npm run wecom:echo           # 企业微信长连接 Echo（需 WECOM_BOT_ID / WECOM_BOT_SECRET）
+npm run wecom:bot            # 企业微信机器人（需 WECOM 凭据 + DEEPSEEK_API_KEY）
+npm run web                  # 网页端（需 DEEPSEEK_API_KEY + DCS_DB_*）
 ```
 
-PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export DEEPSEEK_API_KEY="sk-xxxxxxxx"`。
+**环境变量不会自动加载**：本项目不读取 .env 文件（无 dotenv），所有变量须在 shell 中设置（PowerShell：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export DEEPSEEK_API_KEY="sk-xxxxxxxx"`），仅当前窗口有效。
 
 ### 7.2 环境变量
 
@@ -251,10 +289,25 @@ PowerShell 设置 key：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export
 | `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
 | `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
 | `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（指向本机 DCS 源码树，具体路径不入库）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
+| `DCS_EMBEDDING_URL` / `DCS_EMBEDDING_API_KEY` | search_dcs_knowledge | 集团 Embedding 接口完整请求 URL + 凭据（两项齐备才启用知识库；URL 为完整地址，代码不追加路径）。未配置 → 工具返回能力不可用，systemPrompt 不注入知识库段，不影响其他工具 |
+| `DCS_EMBEDDING_MODEL` | 否 | 默认 `Qwen3-Embedding-8B`；更换模型需重建索引 |
+| `DCS_RERANK_URL` | 否 | 集团 Rerank 接口完整 URL（未配置时检索降级为向量排序并注明） |
+| `DCS_RERANK_API_KEY` / `DCS_RERANK_MODEL` | 否 | Rerank 凭据（缺省复用 Embedding 凭据）/ 模型（默认 `Qwen3-Reranker-8B`） |
+| `KNOWLEDGE_DIR` / `KNOWLEDGE_INDEX_DIR` | 否 | 资料目录（默认 `./knowledge/documents`，gitignored）/ 索引目录（默认 `./data/knowledge`，gitignored） |
+| `DCS_KB_TIMEOUT_MS` / `DCS_KB_CANDIDATES` / `DCS_KB_TOP_N` / `DCS_KB_EMBED_BATCH` | 否 | 接口超时（20000，覆盖正文读取）/ 召回候选（20）/ rerank 返回数（5）/ 向量化批量（16） |
 | `DCS_DB_USER` | query_dcs_data（真实库） | DCS 库用户名（测试期建议只读账号）。与下两项任一缺失 → 数据库查询能力明确返回不可用 |
 | `DCS_DB_PASSWORD` | query_dcs_data（真实库） | DCS 库密码 |
 | `DCS_DB_CONNECT_STRING` | query_dcs_data（真实库） | 连接串（`主机:端口/服务名` 或 EZConnect 格式），oracledb Thin 模式免装 Oracle 客户端 |
 | `DCS_DB_SCHEMA` | 否 | DCS 表所属 schema。**通常无需设置**：未设置时身份链路会自动查 ALL_TABLES 发现 S2_Employee 的 OWNER（唯一时自动采用，多个时要求显式指定，无法访问时报权限错误）。设置后跳过自动发现 |
+| `WEB_PORT` / `WEB_RUN_BUDGET_MS` / `WEB_STATIC_DIR` | 否 | Web 通道端口（8787）/ 单 Run 预算（90000）/ 前端静态目录（默认 ../DCS Agent.web） |
+
+### 7.2.1 三层验证口径（重要区分）
+
+| 层级 | 命令 | 证明什么 | 不证明什么 |
+|---|---|---|---|
+| 离线接线测试 | `npm run check` | Runtime 接线、状态传递、脱敏管线、取消信号、护栏逻辑（Fake 模型 + 假库） | 真实模型行为、真实数据正确性 |
+| 真实运行完成 | `npm run test:live` / `test:live:db` / `test:accept:live` | 真实模型/数据库链路可跑通、Run 正常结束 | 业务答案正确 |
+| **人工业务验收** | `test:accept:live` 的 PENDING_REVIEW 项 | — | 由人工按 expectedFacts 核对实际回答后确认；**正常结束 / 调用过工具 / 命中关键词都不等于业务验收通过** |
 
 ### 7.2.1 企业微信接入（v2 方案）
 
@@ -324,20 +377,24 @@ npm run web   # http://localhost:8787
 | 测试 | 结果 |
 |---|---|
 | `tsc --noEmit` | ✅ 通过 |
-| 冒烟测试（smoke.ts，12 场景 92 项，含审查 F/R 全部回归 + investigate_dcs_code 14 项 + query_dcs_data 12 项） | ✅ 92/92 |
+| 冒烟测试（smoke.ts，12 场景 95 项，含审查 F/R 全部回归 + investigate_dcs_code 14 项 + query_dcs_data 15 项） | ✅ 95/95 |
 | 验收接线（acceptance.ts，FakeStreamFn 预置剧本） | ✅ 全过（仅证明接线，不证明模型行为） |
 | CLI 展示层入口级验证（cli-display.ts，本地假模型） | ✅ 5/5 |
 | 身份链路逻辑（identity.test.ts，文件层 + 数据库层两级解析 + schema 自动发现 + I21 工具描述动态 schema） | ✅ 21/21 |
 | 身份链路真实验证（identity-live.ts，userid 经 WECOM_TEST_USERID 提供，两级解析） | ⏸ 待重跑（2026-09-24 链路升级为数据库解析后） |
 | **身份链路真人验收**（企微"我是谁" → S2_Employee 数据库解析，13:33） | ✅ 2026-09-24 通过（真实工号/姓名/部门返回，schema 自动发现生效；中途 NJS-530 为用户侧网络变化，非代码问题） |
 | Channel 层（wecom.test.ts：即时处理状态机/隔离/去重/超时/迟到丢弃/话术卫生） | ✅ 28/28 |
-| Web Channel 层（web.test.ts：静态页/建档/鉴权/SSE 流式/busy 拒绝/reset） | ✅ 15/15 |
+| Web Channel 层（web.test.ts：静态页/建档/鉴权/SSE 流式/busy 拒绝/reset/处理中 reset 409/超时清理不误删新实例） | ✅ 23/23（2026-09-28 更新，以实际运行输出为准） |
+| Agent 组装工厂（agent-factory.test.ts：拦截 fetch 验证取消信号真实接线/新旧 Run 信号隔离） | ✅ 9/9（2026-09-28 新增） |
+| 验收 harness（acceptance-harness.test.ts：案例加载跳过/会话复用与身份隔离/结果分类/报告渲染） | ✅ 21/21（2026-09-28 新增） |
+| 知识库全链路（knowledge.test.ts：配置门控/分块规则/Embedding与Rerank客户端校验/导入增量同步/原子更新与维度校验/孤儿清理/配置不匹配拒开/检索→重排→出处格式/同义检索/降级/取消/完整片段不截断/长度控制） | ✅ 55/55（2026-09-29 审查修复后，真实 LanceDB 临时库 + mock 集团接口） |
 | 企微长连接 Echo（Step 1，真实联调） | ✅ 2026-09-22 通过（真实 userid/msgid/回复送达） |
 | core 纯净度（无 DCS import） | ✅ grep 验证 |
 | 验收判定对抗（smoke 场景 K：错误字符串含关键词必须 FAIL） | ✅ 4/4 |
 | DeepSeek 真实 key 适配器单测（test:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` |
 | 真实 Oracle 库验证（test:live:db，L-DB1~4：DUAL/数据字典/UPDATE 拒绝/ORA 透传） | ✅ 2026-09-24 通过（连接 / 数据字典 / 护栏 / 错误透传 4/4） |
-| 真实 DeepSeek 验收（test:accept:live，含场景 4 源码自主调查核心 Case） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` 与 `DCS_SOURCE_ROOT` 会话变量，不以假模型代替 |
+| 真实 DeepSeek 验收（test:accept:live，2026-09-28 重建为案例驱动真实业务验收） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` / `DCS_DB_*` / 真实案例（cases.json 待填写，见 §7.5） |
+| 知识库真实链路（集团真实 Embedding/Rerank 接口 + 真实文档导入 → 检索 → Agent 回答含出处） | ⏸ **未验证**——缺集团接口地址与凭据配置（见 §9.9）；离线 46/46 已过，配置后 `npm run knowledge:ingest` 即可启用 |
 | 企微→Agent→回复 端到端（Step 9 真人验收） | ⏸ **未验证**——需凭据配置后真人测试 |
 
 冒烟测试验证点：prompts / context / newMessages 边界与调用方数组不可变性、多 Turn 循环、ToolCall→execute→ToolResult→下一轮 LLM 回填、Agent 状态写回、脱敏管线（含"脱敏发生在回填模型之前"）、beforeToolCall 阻断扩展点、maxTurns 保护（含耗尽时终止说明）、StreamFn 永不 reject 契约，以及审查回归：SSE 坏帧 / 无 finish_reason EOF 编码为 error（H1–H5）、length 截断残缺 toolCalls 剥离与序列化配对（I1–I6）、Hook 异常兜底不泄原文 / 不击穿 Run（J1–J7）。
@@ -360,11 +417,26 @@ npm run web   # http://localhost:8787
   回复：餐标是 35 元/人/日，报餐窗口为工作日 08:00-10:30。
 ```
 
+### 7.5 真实业务验收（案例驱动，2026-09-28 重建）
+
+`npm run test:accept:live` 不再使用模拟身份与模拟事实判定器，改为**本地 JSON 案例驱动**：
+
+1. 案例文件 `test/acceptance-cases/cases.json`（gitignored；模板 `cases.example.json`，填写说明见该目录 README）：每案例含真实工号、真实问题、**人工核实的** `expectedFacts` 与可选 `expectedNextAction`；
+2. 身份用 `resolveEmployeeByCode` 解析（S2_Employee，仅在职，**不回退模拟身份**）；
+3. 相同 `conversationId` 顺序执行并复用同一 Agent（支持追问），不同会话隔离，同一会话不得混用不同员工（违反 → FAILED）；
+4. 每案例记录实际回答、耗时、模型轮次、工具调用数、工具错误数、停止原因；
+5. 运行状态：COMPLETED（正常生成最终回答）/ FAILED（异常、超时、非自然结束）/ SKIPPED（配置或案例缺失；占位符案例不执行、不计入通过率）；
+6. 业务正确性单独标记 **PENDING_REVIEW**——脚本不判定业务对错，由人工按 expectedFacts 核对报告中的实际回答；
+7. 总超时 10 分钟强制收尾；结束关闭数据库连接池；
+8. 报告输出 `test/acceptance-cases/reports/acceptance-<时间戳>.json`（机器可读）与 `.md`（人工核对）。
+
+harness 离线测试（`npm run test:accept:harness`）覆盖案例加载跳过、会话复用与身份隔离、结果分类（含"中间工具错误但成功恢复 ≠ 失败"）、报告渲染。
+
 ---
 
-## 8. v1 明确不做
+## 8. 当前明确不做
 
-知识库 / RAG、图片 / 文件 / 语音、消息缓冲与队列、多用户并发、企微接入、复杂 Session（TTL / 存储）、转人工、工具并行执行、历史消息裁剪、4KB 防爆与 compaction、复杂停止策略、动态 Tool 权限、beforeToolCall 业务校验、ModelError / Runtime Error 体系重构。
+知识库 / RAG、图片 / 文件 / 语音、消息缓冲与队列、多用户并发优化、复杂 Session（TTL / 存储）、转人工、工具并行执行、历史消息裁剪、4KB 防爆与 compaction、复杂停止策略、动态 Tool 权限、beforeToolCall 业务校验、ModelError / Runtime Error 体系重构、SQL 查询权限策略收紧、会话持久化、部署平台建设。后续由真实案例暴露的问题决定优先级（2026-09-28 本轮范围裁定）。
 
 ---
 
@@ -463,6 +535,57 @@ npm run web   # http://localhost:8787
 
 **真机验证与字典修正（2026-09-24 14:17，两位员工实测）**：A+B+C 全部生效——首轮"我有什么权限"3 次调用 / 7 秒完成（对比修复前 52 次 / 68 秒），`[tool]` 日志全程可见每条 SQL。首轮按字典 JOIN ADM 权限表返回 0 行为诚实空结果：**DCS 存在两套并行权限表**——无 ADM 前缀的 `S2_UserRole / S2_Role / S2_RolePermission / S2_Permission` 才是员工主权限（实测孟为峰 221 个角色、莫灼恒 DCS_Developer 角色 14555 条功能权限）；ADM 组（S2_ADMUserRole 等）为管理模块独立权限、普通员工无记录。字典已修正为主权限表组并注明 ADM 组定位，另补防截断聚合提示与"数据字典视图不加 schema 前缀"提示（真机曾报 DCS.ALL_TAB_COLUMNS ORA-00942）。
 
+### 9.7 运行问题修复与真实业务验收入口重建（2026-09-28）
+
+目标：尽快进入真实业务试用。只解决已确认的运行问题与业务验收缺口，不扩展安全/合规/权限治理。
+
+| 变更 | 内容 |
+|---|---|
+| **取消信号接线修复（P0）** | 旧实现：bot.ts / server.ts 把 `holder.controller` 的**初始值复制**进 entry，每 Run 替换的是 entry.controller，模型 `signalProvider` 闭包读的 holder 从未更新——超时 abort 打在模型不读的控制器上，**取消无效**。修复：提取 `src/dcs/agent-factory.ts` 统一组装（session/prompt/tools/hooks/模型适配/maxTurns:24），Web/企微/CLI/验收共用；Channel 层持有**同一个可变 holder 对象**，每 Run 替换 `holder.controller`，模型读取、运行时替换、超时取消三者同一对象。验收：agent-factory.test.ts 拦截全局 fetch，断言模型请求实际收到的 signal 就是 `holder.controller.signal`（同一对象）、abort 后模型调用失败、新 Run 使用新的未中止信号。**边界**：本轮只取消模型请求，不中断已执行中的 Oracle 查询 |
+| **Web 处理中重置竞争修复** | `/api/reset` 在该员工 Agent busy 时返回 **409** `{"ok":false,"message":"上一问正在处理中，请完成后再新建会话。"}`，保留实例与 busy 状态；空闲时正常重置。超时/断开触发的清理改为 `discardEntryIfCurrent`——仅当 Map 中保存的仍是本次运行实例才删除，防止旧运行清理回调误删新实例。**前端注意**：`DCS Agent.web`（独立目录，本轮未改）的 app.js 若未处理 409，用户会在处理中点"新会话"时收到失败——前端需按 409 提示等待 |
+| **SQL 失败状态如实标记** | `query_dcs_data`：guard 拒绝与数据库执行异常均返回 `isError:true`（事件流与 ToolResult 一致）；错误内容保留修正提示供模型改写重试；AgentLoop 继续执行语义不变（工具失败 → ToolResult → 下一轮模型）。验收区分"中间查询出错但成功恢复"与"最终业务失败"：smoke L13（错误→改写→成功→作答全链路）、L8/L9、live-db L-DB3/L-DB4 断言更新 |
+| **真实业务验收入口重建** | test/acceptance-live.ts 弃用模拟身份 + 模拟事实判定器（"42 元/35 元/驳回"不适用于真实员工与真实库），改为案例驱动：`test/acceptance-cases/cases.json`（gitignored，模板 cases.example.json）+ `acceptance-harness.ts`（可离线测试的纯逻辑）+ JSON/Markdown 报告。COMPLETED/FAILED/SKIPPED 三态 + PENDING_REVIEW 人工核对（见 §7.5） |
+| **入口与文档整理** | package.json 新增 `test:identity` / `test:factory` / `test:accept:harness` / `check`（统一离线检查，任一失败非零退出）；.env.example 修正工具名（search_dcs_code → investigate_dcs_code）、补齐 DCS_DB_* / WEB_* 配置、明确"不自动加载 .env"；README 修正"零运行时依赖""不做企微接入"等过期内容，区分离线接线 / 真实运行完成 / 人工业务验收三层口径 |
+
+### 9.8 RAGFlow 知识库接入（2026-09-29，方案：knowledge-rag 用户指令）
+
+| 项 | 内容 |
+|---|---|
+| **新增工具** | `search_dcs_knowledge`（src/dcs/knowledge/：types.ts 配置解析 + client.ts 检索客户端 + tool.ts 工具）。RAGFlow v0.27.x `POST /api/v1/retrieval` 片段检索，只检索不生成（答案由主模型综合）；混合检索 `keyword:true`；≤6 片段/单片段 1200 字/总输出 8000 字；超时默认 15s |
+| **取消机制** | `DcsToolContext` 增加可选 `holder`（与模型 signalProvider 同一可变对象，agent-factory 组装时注入 `toolContext:{session,holder}`）；客户端用 `AbortSignal.any([超时信号, run信号])` 合并——Run 超时/用户停止后检索请求立即中止（knowledge.test K6 以真实工厂+假 streamFn 验证链路） |
+| **结果口径** | 未配置（RAGFLOW_* 缺失）→ isError:true "能力不可用"，systemPrompt 不注入知识库段（模型不会调用不可用能力）；未找到（code=0 空结果）→ isError:false 明确"未找到"；服务失败（HTTP/业务码/网络/超时/取消）→ isError:true 供模型换路 |
+| **提示词** | buildSystemPrompt 按配置注入知识库能力段；新增【出处引用】段：文档答案附出处（`依据：《文档》—章节`）、多资料冲突时明确指出、无证据不编造 |
+| **测试** | test/knowledge.test.ts 22 项（mock RAGFlow，含 2026-09-28 假绿灯教训的 settle 路径）；npm script `test:knowledge` 已并入 `check` |
+| **部署缺口（如实记录）** | 本机 **Docker 未安装**（RAGFlow 官方要求 Docker≥24 + Compose≥2.26.1，Windows 需 Docker Desktop/WSL2；本机 C 盘仅剩 9GB，安装位置须改 D 盘；内存 16GB 为官方最低线）。知识库真实链路（上传→解析→检索→回答）**未验证**，部署步骤见 §6.1；测试文档模板见 test/acceptance-cases/knowledge-testdoc.md（上传到独立测试知识库，勿混入正式资料） |
+
+> **注**：本节为历史档案。RAGFlow 方案当日被 §9.9 本地方案替换（部署缺口正是替换动因之一），RAGFlow 专用客户端/配置/部署说明已移除。
+
+### 9.9 知识库方案替换：RAGFlow → 本地解析 + LanceDB + 集团接口（2026-09-29，用户两段式指令）
+
+保留全部基础修复（模型取消/超时/会话竞争/SQL 错误标记/真实业务验收/agent-factory），只针对性替换知识库实现，未整体回滚、未用 git reset。
+
+| 项 | 内容 |
+|---|---|
+| **移除** | RAGFlow 专用 client.ts / types.ts（配置 RAGFLOW_*）、Docker/WSL2/RAGFlow 部署要求与说明。未触碰任何无关代码 |
+| **保留** | 工具名 `search_dcs_knowledge` 与 query 参数、出处输出、总长度限制（~8000 字）、取消机制（ctx.holder → AbortSignal 合并）、AgentLoop 零改动、提示词注入逻辑（getKnowledgeConfig 同名替换，prompt.ts 仅改 import 路径） |
+| **新模块** | `src/dcs/knowledge/`：config.ts（DCS_EMBEDDING_*/DCS_RERANK_*/KNOWLEDGE_* 等 11 项环境变量）→ extract.ts（mammoth DOCX / pdf-parse v2 逐页 PDF / MD/TXT；空文档与扫描版明确报错；.doc 提示转存）→ chunk.ts（标题链/表格表头重复/600–1000 字目标/句子切分 100 字重叠/PDF 页码如实保留、CHUNKING_VERSION 固化）→ embedding.ts（OpenAI 兼容格式；`data[].index` 对位；数量/维度/数值校验；首请求探测维度；超时覆盖正文读取全过程）→ rerank.ts（`results[].index` 找回候选；越界/重复/分数校验；top_n≤候选数；不发送文档冲突的 prompt 字段）→ store.ts（LanceDB + 显式 Arrow schema——null 字段必须显式声明，类型推断会失败；归一化向量 + cosine 距离；index-meta.json 固化模型/维度/分块版本，不匹配拒绝打开）→ ingest.ts（增量同步四态 + 单文件失败保留旧版）→ tool.ts（内部换检索流程，对外契约不变）|
+| **导入入口** | `npm run knowledge:ingest`（scripts/knowledge-ingest.ts）；资料目录 knowledge/documents/ 与索引 data/knowledge/ 已 gitignored |
+| **失败语义** | Embedding 失败 → isError:true（不伪装无资料）；Rerank 失败/超时/未配置 → 降级向量序并在结果注明（不阻断）；索引未建 → isError:false 正常说明；Run 取消 → 中止 HTTP |
+| **测试** | knowledge.test.ts 重写为 46 项（真实 LanceDB 临时目录 + mock 集团接口按 URL 分发）：配置门控/分块规则 5 项/Embedding 客户端 6 项（含乱序 index 对位、NaN、超时）/Rerank 客户端 3 项/导入增量同步 8 项（新增/跳过/更新/删除/失败保留/空文档/配置不匹配拒开）/检索链路 9 项（含中文同义「取消报餐」→「撤销订餐」、降级、未建索引）/Run 取消真实链路 4 项/长度控制/注册与注入。**坑：LanceDB 对 null 字段无法类型推断需显式 Arrow schema；表目录为 `<name>.lance`；mock 双接口必须按 URL 分发** |
+| **依赖** | 新增 @lancedb/lancedb@0.39.0、mammoth@1.13.0、pdf-parse@2.4.5（3 个 high 漏洞均来自 sharp/libvips，系 lancedb 可选传递依赖 @huggingface/transformers，本项目不使用该推理路径，不因此降级） |
+| **未验证（如实记录）** | 集团真实 Embedding/Rerank 接口连通与真实响应格式（**需用户提供：DCS_EMBEDDING_URL、DCS_EMBEDDING_API_KEY，可选 DCS_RERANK_URL/API_KEY**——文档地址已脱敏，代码用完整 URL 不追加路径）；真实文档导入→检索→Agent 回答含出处的端到端。接口可用后：`npm run knowledge:ingest` → 提问验证（测试问题见 test/acceptance-cases/knowledge-testdoc.md） |
+
+### 9.10 知识库审查修复（2026-09-29，外部代码审查三缺陷）
+
+架构不变，只修三处必要缺陷，未扩展框架：
+
+| 缺陷 | 修复 |
+|---|---|
+| **1. 更新失败丢旧资料**（先删后写，写入失败旧分块已删） | 原子替换：先写新分块（新 documentId）→ 成功后再删旧分块——写入失败时旧版本完整保留仍可检索；删除失败的残留由每次导入末尾的孤儿清理（findOrphanDocumentIds）移除；更新前显式校验向量维度与索引一致（不一致拒绝写入）。回归：K5i–K5l |
+| **2. 长片段截断丢关键条件**（分块允许 2000 字但渲染只取 1500，末尾限制条件可能丢失） | 渲染返回完整片段正文，删除单片段截断；总长度约 8000 字控制改为按 rank 舍弃低排名【完整片段】（rank 1 无条件保留），并注明省略数量。回归：K9b'/K9d/K9e（构造末尾含"10:30 截止不可撤销"的长片段验证完整保留） |
+| **3. 标题章节不参与检索**（只有正文参与向量化/重排序，长章节尾部片段缺上下文） | 新增 embeddingText（《标题》+章节+正文），导入向量化与检索 rerank 统一使用；展示仍用原文+出处。CHUNKING_VERSION 1→2 强制重建索引（旧索引向量未含标题信息）。回归：K9a'/K9c |
+| **DOCX 能力边界**（纯文本提取，不保留标题层级与表格结构） | README §6.1 明确说明：制度表格类资料导入后需人工核对，不默认结构完整（见该节"DOCX 能力边界"） |
+
 ---
 
 ## 10. 快速上手（开发者）
@@ -470,18 +593,21 @@ npm run web   # http://localhost:8787
 ```bash
 cd <DCS-Agent 仓库本地目录>
 npm install
+
+# 1. 离线检查（无需任何凭据；任一失败非零退出）
+npm run check
+
+# 2. CLI 真实模型调试（默认模拟身份；环境变量需在 shell 设置，不自动加载 .env）
 # PowerShell：
 $env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"
 # bash：
 # export DEEPSEEK_API_KEY="sk-xxxxxxxx"
 npm run dev
-# REPL 中依次输入：
-#   为什么我没有权限管理菜单
-#   我为什么报不了餐
-#   那餐标是多少
-#   exit
-# 或一键自动验收三问（证据留存）：
+
+# 3. 真实业务验收（真实员工身份 + 真实库 + 真实模型，见 §7.5）
+#    先按 test/acceptance-cases/cases.example.json 填写真实案例（cases.json）
+$env:DCS_DB_USER="xxx"; $env:DCS_DB_PASSWORD="xxx"; $env:DCS_DB_CONNECT_STRING="host:1521/SVC"
 npm run test:accept:live
 ```
 
-扩展指引：加工具 → `dcs/tools.ts` 实现 `ToolDefinition<Args, DcsToolContext>` 并加入 `dcsTools`；换模型 → 实现 `StreamFn` 契约替换 `deepseek.ts`；接入企微 → 只替换 `dcs/session.ts` 的会话构造，core 零改动。
+扩展指引：加工具 → `dcs/tools.ts` 实现 `ToolDefinition<Args, DcsToolContext>` 并加入 `dcsTools`；换模型 → 实现 `StreamFn` 契约替换 `deepseek.ts`；组装 Agent → 一律走 `dcs/agent-factory.ts` 的 `createDcsAgent`（不要在 Channel 层手写 new Agent）。

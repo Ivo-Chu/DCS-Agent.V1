@@ -87,7 +87,10 @@ async function resolveEmployeeSchema(client: NonNullable<ReturnType<typeof getDb
     console.error(
       `[identity] schema 自动发现失败：${String(err).slice(0, 200)}（可用 DCS_DB_SCHEMA 显式指定绕过）`
     );
-    discoveredSchema = null;
+    // 异常多为临时性故障（网络不可达/VPN 未连等），不缓存失败结果——
+    // 否则一次故障会毒化整个进程，网络恢复后仍永远拒答（2026-09-28 踩坑）。
+    // 下次调用会重新发现；明确的配置性失败（0 个/多个 owner）仍缓存 null。
+    return null;
   }
   return discoveredSchema;
 }

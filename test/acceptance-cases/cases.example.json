@@ -1,0 +1,29 @@
+[
+  {
+    "id": "permission-001",
+    "conversationId": "employee-a-permission",
+    "employeeCode": "<真实测试工号>",
+    "question": "<真实问题，例如：我在DCS里有哪些菜单权限？>",
+    "expectedFacts": ["<人工核实的事实1，例如：该员工拥有XX角色>"],
+    "expectedNextAction": "<期望建议，允许留空字符串>",
+    "maxDurationMs": 15000
+  },
+  {
+    "id": "permission-002-followup",
+    "conversationId": "employee-a-permission",
+    "employeeCode": "<真实测试工号，必须与 permission-001 相同>",
+    "question": "<同会话追问，例如：那报餐管理的权限是谁控制的？>",
+    "expectedFacts": ["<人工核实的事实>"],
+    "expectedNextAction": "",
+    "maxDurationMs": 15000
+  },
+  {
+    "id": "meal-001",
+    "conversationId": "employee-b-meal",
+    "employeeCode": "<另一位真实测试工号>",
+    "question": "<真实问题，例如：我最近的报餐记录是什么状态？>",
+    "expectedFacts": ["<人工核实的事实>"],
+    "expectedNextAction": "",
+    "maxDurationMs": 15000
+  }
+]

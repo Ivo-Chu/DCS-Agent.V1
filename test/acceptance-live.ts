@@ -1,177 +1,181 @@
 /**
- * 真实 DeepSeek 三问验收（方案 §11 / §12 步骤 5 的自动化版本）。
+ * 真实业务验收入口（2026-09-28 重建，案例驱动）。
  *
- * 与 test/acceptance.ts（FakeStreamFn 接线验证）的区别：
- * - 模型为真实 DeepSeek（需 DEEPSEEK_API_KEY），不使用任何假模型代替；
- * - 工具调用序列、最终回复全部由真实模型决策产生，此处只记录与判定；
- * - 三问在同一 Agent 会话中依次提出（场景 3 依赖场景 2 的历史上下文）。
+ * 与离线验收录（test/acceptance.ts + smoke 场景 K）完全分离：
+ * - 离线：FakeStreamFn 剧本 + 模拟事实判定（42 元 / 35 元 / 驳回），验证接线；
+ * - 本入口：真实 DeepSeek + 真实 Oracle + 真实员工身份（resolveEmployeeByCode，
+ *   不回退模拟身份），验证真实业务行为；业务正确性只标记 PENDING_REVIEW，
+ *   由人工按 expectedFacts 核对——正常结束 / 调用过工具 / 命中关键词
+ *   都不等于业务验收通过。
  *
- * 判定规则（R1 审查修复，逻辑见 test/acceptance-judge.ts，
- * 已由 smoke.ts 场景 K 的对抗测试离线验证）：
- * - 每问必须正常结束：无 agent_error、末条 AssistantMessage 为自然 stop——
- *   API 错误文字即使包含全部关键词也必须 FAIL；
- * - 必要工具必须真实执行成功（tool_execution_end 存在且 isError=false），
- *   并核对 menuName / dataType 与结果摘要中的关键事实；
- * - 未设置 DEEPSEEK_API_KEY → 输出"未验证（SKIPPED）"并退出，跳过 ≠ 通过。
+ * 案例文件：test/acceptance-cases/cases.json（gitignored，模板见 cases.example.json）。
+ * 输出：test/acceptance-cases/reports/acceptance-<时间戳>.json / .md
  *
- * R2（审查修复）：打印每问的实际回复全文与工具调用成败，
- * 兑现"证据留存"承诺——正常通过与失败时日志中都有真实回答可查。
+ * 运行状态：
+ * - COMPLETED：正常生成最终回答（业务正确性 → PENDING_REVIEW 待人工核对）
+ * - FAILED：运行异常、案例超时、非自然结束、会话内混用不同员工、工号无法解析
+ * - SKIPPED：未配置 DEEPSEEK_API_KEY / DCS_DB_* / 案例文件缺失或全为占位符
  *
  * 运行：npm run test:accept:live
  */
-import { Agent } from "../src/core/agent.ts";
+import * as path from "node:path";
 import type { AgentEvent } from "../src/core/events.ts";
-import { createDeepSeekStreamFn } from "../src/core/model/deepseek.ts";
-import { createDcsToolHooks } from "../src/dcs/hooks.ts";
-import { buildSystemPrompt } from "../src/dcs/prompt.ts";
-import { createMockSession } from "../src/dcs/session.ts";
-import { dcsTools } from "../src/dcs/tools.ts";
+import { createDcsAgent, type DcsAgentHolder } from "../src/dcs/agent-factory.ts";
+import { resolveEmployeeByCode } from "../src/dcs/identity.ts";
+import { createSession } from "../src/dcs/session.ts";
+import { closeDbClient } from "../src/dcs/db/client.ts";
 import {
-  judgeScenario1,
-  judgeScenario2,
-  judgeScenario3,
-  type JudgeResult,
-  type QEvents,
-} from "./acceptance-judge.ts";
+  classifyRun,
+  ConversationRegistry,
+  loadCases,
+  writeReports,
+  type AcceptanceCase,
+  type CaseResult,
+  type HarnessAgent,
+} from "./acceptance-harness.ts";
 
-let failed = 0;
+const CASES_FILE = path.resolve(import.meta.dirname, "acceptance-cases", "cases.json");
+const REPORTS_DIR = path.resolve(import.meta.dirname, "acceptance-cases", "reports");
+/** 本轮总超时：避免验收脚本无限挂起（10 分钟）。 */
+const TOTAL_BUDGET_MS = 10 * 60 * 1000;
 
-function report(label: string, r: JudgeResult): void {
-  if (r.ok) {
-    console.log(`    ✓ ${label}`);
-  } else {
-    failed++;
-    console.log(`    ✗ ${label}`);
-    for (const f of r.failures) console.log(`        - ${f}`);
+async function main(): Promise<void> {
+  const missing: string[] = [];
+  if (!process.env.DEEPSEEK_API_KEY) missing.push("DEEPSEEK_API_KEY");
+  for (const k of ["DCS_DB_USER", "DCS_DB_PASSWORD", "DCS_DB_CONNECT_STRING"]) {
+    if (!process.env[k]) missing.push(k);
   }
-}
-
-/** 从事件流收集判定输入。 */
-function collect(events: AgentEvent[]): QEvents {
-  const qe: QEvents = { toolStarts: [], toolEnds: [], agentErrors: [], lastAssistantStop: null };
-  for (const e of events) {
-    if (e.type === "tool_execution_start") {
-      qe.toolStarts.push({ toolName: e.toolName, args: e.args });
-    } else if (e.type === "tool_execution_end") {
-      qe.toolEnds.push({ toolName: e.toolName, isError: e.isError, summary: e.summary });
-    } else if (e.type === "agent_error") {
-      qe.agentErrors.push(e.message);
-    } else if (e.type === "assistant_message") {
-      qe.lastAssistantStop = e.message.stopReason;
-    }
-  }
-  return qe;
-}
-
-async function main() {
-  if (!process.env.DEEPSEEK_API_KEY) {
+  if (missing.length > 0) {
     console.log("========== 未验证（SKIPPED） ==========");
-    console.log("未设置 DEEPSEEK_API_KEY：真实 DeepSeek 三问验收未执行。");
-    console.log("本验收不接受假模型代替；此前的 FakeStreamFn 结果只证明接线，不证明模型行为。");
-    console.log("设置后运行：$env:DEEPSEEK_API_KEY = 'sk-xxxxxxxx'（PowerShell）或 export DEEPSEEK_API_KEY='sk-xxxxxxxx'（bash）");
-    console.log("然后执行：npm run test:accept:live");
+    console.log(`未设置：${missing.join(" / ")}——真实业务验收未执行（不读取或打印任何已有密钥文件）。`);
+    console.log("真实验收需要真实模型与真实数据库；不以模拟身份/假数据代替。");
+    console.log("配置后运行：npm run test:accept:live");
     process.exit(0);
   }
 
-  const session = createMockSession();
-  const agent = new Agent({
-    systemPrompt: buildSystemPrompt(session),
-    tools: dcsTools,
-    streamFn: createDeepSeekStreamFn(),
-    toolContext: { session },
-    hooks: createDcsToolHooks(),
-    // 方案 v2 §9：测试期宽松安全阀（非生产参数）
-    maxTurns: 24,
+  const { cases, skippedAll, skippedCases } = loadCases(CASES_FILE);
+  if (cases.length === 0) {
+    console.log("========== 未验证（SKIPPED） ==========");
+    for (const s of skippedAll) console.log(`- ${s}`);
+    console.log("请按 test/acceptance-cases/cases.example.json 填写真实案例（cases.json）。");
+    process.exit(0);
+  }
+
+  console.log("========== DCS Agent 真实业务验收（案例驱动） ==========");
+  console.log(
+    `有效案例 ${cases.length} 个${skippedCases.length ? `（另有 ${skippedCases.length} 个占位案例跳过，不计入通过率）` : ""}`
+  );
+
+  // 真实链路：resolveEmployeeByCode（S2_Employee，仅在职）+ createDcsAgent。
+  // 每会话一个 holder（createDcsAgent 的 signalProvider 读取同一对象），
+  // 每案例 Run 开始时替换 controller（与 Web/企微同口径）。
+  const holders = new Map<string, DcsAgentHolder>();
+  const registry = new ConversationRegistry({
+    resolveIdentity: resolveEmployeeByCode,
+    createAgent: (identity, conversationId): HarnessAgent => {
+      const holder: DcsAgentHolder = { controller: new AbortController() };
+      holders.set(conversationId, holder);
+      return createDcsAgent({
+        session: createSession(identity, `accept-${conversationId}`, "web"),
+        holder,
+      });
+    },
   });
 
-  const events: AgentEvent[] = [];
-  agent.subscribe((e) => events.push(e));
+  // 总超时保护：到时中止所有会话并按非零退出码收尾，避免脚本无限挂起
+  const totalTimer = setTimeout(() => {
+    console.error(`\n[accept] 本轮总超时（${TOTAL_BUDGET_MS / 60000} 分钟），强制中止所有会话并退出。`);
+    for (const h of holders.values()) h.controller.abort();
+    void closeDbClient()
+      .catch(() => undefined)
+      .finally(() => process.exit(1));
+  }, TOTAL_BUDGET_MS);
 
-  const run = async (question: string): Promise<string> => {
-    events.length = 0;
-    console.log(`\n你> ${question}`);
-    const reply = await agent.prompt(question);
-    // R2：打印实际回复全文（证据留存）
-    console.log(`助手> ${reply}`);
-    // R2：工具调用与成败（参数由 judge 核对，此处只列名称与状态）
-    for (const e of events) {
-      if (e.type === "tool_execution_start") {
-        console.log(`  [工具] ${e.toolName} 开始`);
-      } else if (e.type === "tool_execution_end") {
-        console.log(`  [工具] ${e.toolName} ${e.isError ? "失败" : "成功"}`);
+  const results: CaseResult[] = [];
+  try {
+    for (const c of cases) {
+      console.log(`\n--- 案例 ${c.id}（会话 ${c.conversationId}，工号 ${c.employeeCode}）---`);
+      console.log(`问：${c.question}`);
+      const r = await runCase(c, registry, holders);
+      results.push(r);
+      if (r.status === "COMPLETED") {
+        console.log(`答：${r.answer?.slice(0, 200)}${(r.answer?.length ?? 0) > 200 ? "…" : ""}`);
+        console.log(
+          `[运行] COMPLETED（${r.durationMs}ms，turns=${r.turns}，toolCalls=${r.toolCalls}，toolErrors=${r.toolErrors}，stop=${r.stopReason}）→ 业务正确性 PENDING_REVIEW（人工按 expectedFacts 核对）`
+        );
+      } else {
+        console.log(`[运行] ${r.status}：${r.reason ?? ""}`);
       }
     }
-    return reply;
-  };
-
-  console.log("========== DCS Agent 真实三问验收（DeepSeek） ==========");
-  console.log(`当前员工：${session.user.name}（${session.user.employeeNo}，${session.user.department}）`);
-
-  // ---- 场景 1：权限诊断 ----
-  console.log("\n=== 场景 1：为什么我没有权限管理菜单 ===");
-  const reply1 = await run("为什么我没有权限管理菜单");
-  const qe1 = collect(events);
-  console.log(`[历史消息数] ${agent.context.length}`);
-  report("场景 1 判定", judgeScenario1(qe1, reply1));
-
-  // ---- 场景 2：报餐诊断（先权限后业务数据） ----
-  console.log("\n=== 场景 2：我为什么报不了餐 ===");
-  const before2 = agent.context.length;
-  const reply2 = await run("我为什么报不了餐");
-  const qe2 = collect(events);
-  console.log(`[历史消息数] ${agent.context.length}（提问前 ${before2}）`);
-  report("场景 2 判定", judgeScenario2(qe2, reply2));
-
-  // ---- 场景 3：追问餐标（同一会话，验证历史上下文生效） ----
-  console.log("\n=== 场景 3：追问「那餐标是多少」（同一会话） ===");
-  const before3 = agent.context.length;
-  const reply3 = await run("那餐标是多少");
-  const qe3 = collect(events);
-  console.log(`[历史消息数] ${agent.context.length}（提问前 ${before3}）`);
-  report("场景 3 判定", judgeScenario3(qe3, reply3));
-  if (agent.context.length <= before3) {
-    failed++;
-    console.log("    ✗ 历史上下文未增长（newMessages 未写回）");
-  } else {
-    console.log("    ✓ 历史上下文持续累积（newMessages 写回）");
+  } finally {
+    clearTimeout(totalTimer);
+    // 关闭数据库连接池（poolMin=1 常驻连接会让进程挂住）
+    await closeDbClient().catch(() => undefined);
   }
 
-  // ---- 场景 4（方案 v2 §12 核心验收 Case）：源码自主调查 ----
-  // 不提示任何搜索关键词，观察模型能否：
-  // 理解问题 → 自主调用 investigate_dcs_code → 选择下一条线索 → 再次调用 →
-  // 综合证据 → 给出有依据的业务解释。
-  console.log("\n=== 场景 4：核心验收 Case——离职流程协调员显示（源码自主调查） ===");
-  if (!process.env.DCS_SOURCE_ROOT) {
-    console.log("    ⏸ SKIPPED：未配置 DCS_SOURCE_ROOT，源码调查能力不可用，本场景不执行（跳过 ≠ 通过）。");
-    console.log("       配置后运行：$env:DCS_SOURCE_ROOT = 'D:\\work\\DCS code'（PowerShell）");
-  } else {
-    const reply4 = await run("黄石智通已勾选无需协调员，为什么离职流程还会显示协调员信息");
-    const qe4 = collect(events);
-    const investigates = qe4.toolEnds.filter((t) => t.toolName === "investigate_dcs_code");
-    const investigateOk = investigates.some((t) => !t.isError);
-    const reasons: string[] = [];
-    if (!investigateOk) reasons.push("未成功执行任何 investigate_dcs_code（源码自主调查未发生）");
-    if (qe4.agentErrors.length > 0) reasons.push(`存在 agent_error：${qe4.agentErrors.join("; ")}`);
-    if (qe4.lastAssistantStop !== "stop") reasons.push(`末轮非自然 stop：${String(qe4.lastAssistantStop)}`);
-    if (!reply4.includes("协调员")) reasons.push("回复未围绕「协调员」展开（缺少与问题直接相关的结论）");
-    if (reasons.length === 0) {
-      console.log(`    ✓ 场景 4 判定通过（investigate_dcs_code 成功 ${investigates.filter((t) => !t.isError).length} 次，回复含业务解释）`);
-      console.log("    [观察要点] 模型是否自主选择关键词、是否多轮深入、推理链是否区分事实/推断——详见上方回复全文");
-    } else {
-      failed++;
-      console.log("    ✗ 场景 4 判定未通过");
-      for (const r of reasons) console.log(`        - ${r}`);
-    }
-  }
+  const { mdPath } = writeReports(REPORTS_DIR, results, skippedAll, skippedCases);
+  const completed = results.filter((r) => r.status === "COMPLETED").length;
+  const failed = results.filter((r) => r.status === "FAILED").length;
+  const pendingReview = results.filter((r) => r.businessReview === "PENDING_REVIEW").length;
 
-  // ---- 汇总 ----
   console.log("\n========== 验收结果 ==========");
-  if (failed > 0) {
-    console.log(`FAIL：${failed} 项判定未通过（真实 DeepSeek）`);
-    process.exit(1);
-  }
-  console.log("PASS：验收场景全部通过（真实 DeepSeek）");
-  console.log("[证据留存] 各场景实际回复全文、工具调用成败、历史消息数见上方日志。");
+  console.log(
+    `COMPLETED ${completed} / FAILED ${failed} / SKIPPED ${results.length - completed - failed}` +
+      (skippedAll.length + skippedCases.length ? `（另跳过 ${skippedAll.length + skippedCases.length}）` : "")
+  );
+  console.log(`业务正确性 PENDING_REVIEW（待人工核对）：${pendingReview} 项`);
+  console.log(`报告已写入：${mdPath}`);
+
+  if (failed > 0) process.exit(1);
+  process.exit(0);
 }
 
-main();
+/** 单案例执行：会话校验 → 新 controller → prompt（案例级超时 abort）→ 分类。 */
+async function runCase(
+  c: AcceptanceCase,
+  registry: ConversationRegistry,
+  holders: Map<string, DcsAgentHolder>
+): Promise<CaseResult> {
+  const base: CaseResult = {
+    id: c.id,
+    conversationId: c.conversationId,
+    employeeCode: c.employeeCode,
+    question: c.question,
+    status: "FAILED",
+    businessReview: "N/A",
+    expectedFacts: c.expectedFacts,
+    expectedNextAction: c.expectedNextAction,
+  };
+
+  const conv = await registry.get(c.conversationId, c.employeeCode);
+  if (conv.error || !conv.slot) {
+    return { ...base, reason: conv.error ?? "会话建立失败" };
+  }
+  const holder = holders.get(c.conversationId);
+  if (!holder) {
+    return { ...base, reason: "会话取消信号持有器缺失（内部错误）" };
+  }
+  // 每 Run 新控制器（与 Web/企微同口径）；案例超时 abort 模型请求
+  holder.controller = new AbortController();
+
+  const events: AgentEvent[] = [];
+  const unsubscribe = conv.slot.agent.subscribe((e) => events.push(e));
+  const startedAt = Date.now();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    holder.controller.abort();
+  }, c.maxDurationMs ?? 15_000);
+
+  try {
+    const answer = await conv.slot.agent.prompt(c.question);
+    return classifyRun(c, { answer, events, timedOut, durationMs: Date.now() - startedAt });
+  } catch (err) {
+    return classifyRun(c, { answer: "", events, timedOut, durationMs: Date.now() - startedAt, error: err });
+  } finally {
+    clearTimeout(timer);
+    unsubscribe();
+  }
+}
+
+void main();

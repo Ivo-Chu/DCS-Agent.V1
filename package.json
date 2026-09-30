@@ -7,17 +7,24 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "web": "tsx src/web/server.ts",
-    "wecom:echo": "tsx src/wecom/echo.ts",
-    "wecom:bot": "tsx src/wecom/bot.ts",
-    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && tsx test/smoke.ts && tsx test/acceptance.ts && tsx test/cli-display.ts && tsx test/wecom.test.ts && tsx test/web.test.ts && tsx test/identity.test.ts && tsx test/agent-factory.test.ts && tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts",
+    "knowledge:e2e": "tsx scripts/knowledge-e2e.ts",
+    "knowledge:ingest": "tsx scripts/knowledge-ingest.ts",
     "test": "tsx test/smoke.ts",
     "test:accept": "tsx test/acceptance.ts",
+    "test:accept:harness": "tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts",
+    "test:accept:live": "tsx test/acceptance-live.ts",
     "test:cli": "tsx test/cli-display.ts",
-    "test:wecom": "tsx test/wecom.test.ts",
-    "test:web": "tsx test/web.test.ts",
+    "test:factory": "tsx test/agent-factory.test.ts",
+    "test:identity": "tsx test/identity.test.ts",
+    "test:knowledge": "tsx test/knowledge.test.ts",
     "test:live": "tsx test/deepseek-live.ts",
     "test:live:db": "tsx test/live-db.ts",
-    "test:accept:live": "tsx test/acceptance-live.ts"
+    "test:web": "tsx test/web.test.ts",
+    "test:wecom": "tsx test/wecom.test.ts",
+    "typecheck": "tsc --noEmit",
+    "wecom:bot": "tsx src/wecom/bot.ts",
+    "wecom:echo": "tsx src/wecom/echo.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -29,7 +36,10 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@lancedb/lancedb": "^0.39.0",
     "@wecom/aibot-node-sdk": "^1.0.7",
-    "oracledb": "^7.0.1"
+    "mammoth": "^1.13.0",
+    "oracledb": "^7.0.1",
+    "pdf-parse": "^2.4.5"
   }
 }

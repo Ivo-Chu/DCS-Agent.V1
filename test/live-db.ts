@@ -71,11 +71,12 @@ async function main(): Promise<void> {
 
   // 3. 护栏在真实链路生效
   const rejected = await queryDcsDataTool.execute({ sql: `UPDATE ${schema ? schema + "." : ""}S2_Employee SET NAME = 'x'` }, dcsCtx);
-  check("L-DB3 写操作被护栏拒绝（不触达数据库）", !rejected.isError && rejected.output.includes("SQL 被拒绝"));
+  check("L-DB3 写操作被护栏拒绝且如实标记失败（isError:true，不触达数据库）",
+    rejected.isError === true && rejected.output.includes("SQL 被拒绝"));
 
-  // 4. ORA 错误透传（真实错误码）
+  // 4. ORA 错误透传（真实错误码；isError:true 如实反映失败）
   const oraErr = await queryDcsDataTool.execute({ sql: "SELECT * FROM DCS_AGENT_NOT_EXIST_TABLE" }, dcsCtx);
-  check("L-DB4 ORA 错误透传供模型自修正（含错误码）", !oraErr.isError && oraErr.output.includes("ORA-"),
+  check("L-DB4 ORA 错误透传供模型自修正（isError:true，含错误码）", oraErr.isError === true && oraErr.output.includes("ORA-"),
     oraErr.output.slice(0, 200));
 
   // 5. 身份链路 SQL 可达（identity.ts 使用的同一条查询；带 schema 前缀）

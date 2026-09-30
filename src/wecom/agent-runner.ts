@@ -16,12 +16,21 @@
  */
 import { randomUUID } from "node:crypto";
 
+/** 可变取消信号持有器：与模型 signalProvider 读取的是同一个对象。 */
+export interface AbortHolder {
+  controller: AbortController;
+}
+
 /** 每用户的 Agent 及其取消信号持有器（Agent 由 Channel 层创建）。 */
 export interface UserAgentSlot {
   /** 现有 Agent 实例（类型放宽，避免本模块依赖 core）。 */
   agent: { prompt(question: string): Promise<string> };
-  /** 当前 Run 的取消控制器；每次 Run 开始时替换。 */
-  controller: AbortController;
+  /**
+   * 当前 Run 的取消信号持有器；每次 Run 开始时替换其中的 controller。
+   * 必须传可变对象（不是 controller 的复制引用）——模型的 signalProvider
+   * 闭包读取同一 holder，替换 holder.controller 后模型立即使用新信号。
+   */
+  holder: AbortHolder;
 }
 
 export interface AgentRunnerDeps {
@@ -77,8 +86,9 @@ export class AgentRunner {
 
       void (async () => {
         const slot = this.deps.getSlot(userId);
-        // 新 Run 新控制器：旧 Run 的 aborted signal 不会影响新 Run
-        slot.controller = new AbortController();
+        // 新 Run 新控制器：替换 holder 内的 controller（模型 signalProvider
+        // 读取同一 holder，立即生效）；旧 Run 的 aborted signal 不影响新 Run
+        slot.holder.controller = new AbortController();
         const streamId = this.deps.newStreamId();
 
         try {
@@ -90,7 +100,7 @@ export class AgentRunner {
         cancelTimer = schedule(() => {
           if (finished) return;
           // 超时：Abort 模型请求（含旧 Run 后续请求）→ 废弃 Agent → 超时提示 → 结束
-          slot.controller.abort();
+          slot.holder.controller.abort();
           this.deps.discardAgent(userId);
           finish();
           void this.deps

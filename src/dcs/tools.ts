@@ -24,6 +24,7 @@ import { getDbClient } from "./db/client.ts";
 import { guardSql } from "./db/guard.ts";
 import { formatQueryResult } from "./db/format.ts";
 import { getDiscoveredSchema } from "./identity.ts";
+import { searchDcsKnowledgeTool } from "./knowledge/tool.ts";
 
 // ---------------------------------------------------------------------------
 // 工具 1：investigate_dcs_code（方案 v2：搜索 + 定位 + 上下文融合，只读）
@@ -421,7 +422,9 @@ export const queryDcsDataTool: ToolDefinition<QueryDcsDataArgs, DcsToolContext> 
     // 护栏：仅防卡死与误写（单条只读语句）
     const guard = guardSql(sql);
     if (!guard.ok) {
-      return { output: `SQL 被拒绝：${guard.reason}`, isError: false };
+      // 2026-09-28：guard 拒绝是真实的执行失败，必须如实标记 isError:true
+      //（事件流与 ToolResult 一致）；错误内容保留修正提示，模型可改写后重试。
+      return { output: `SQL 被拒绝：${guard.reason}。请改写为单条只读 SELECT/WITH 语句后重试。`, isError: true };
     }
 
     // 环境变量门控：与 DCS_SOURCE_ROOT 同一模式
@@ -438,9 +441,12 @@ export const queryDcsDataTool: ToolDefinition<QueryDcsDataArgs, DcsToolContext> 
       const { output } = formatQueryResult(columns, rows);
       return { output };
     } catch (err) {
-      // ORA 错误截断后原样返回模型（供自我修正 SQL 重试）；永不抛异常
+      // ORA 错误截断后原样返回模型（供自我修正 SQL 重试）；永不抛异常。
+      // 2026-09-28：执行异常是真实的工具失败，标记 isError:true（事件流与
+      // ToolResult 一致）；AgentLoop 语义不变——工具失败仍生成 ToolResult
+      // 交给下一轮模型修正，不会终止整个 Run。
       const msg = String(err instanceof Error ? err.message : err).slice(0, MAX_ERROR_CHARS);
-      return { output: `查询出错（可修正 SQL 后重试）：${msg}`, isError: false };
+      return { output: `查询出错（可修正 SQL 后重试）：${msg}`, isError: true };
     }
   },
 };
@@ -448,6 +454,7 @@ export const queryDcsDataTool: ToolDefinition<QueryDcsDataArgs, DcsToolContext> 
 // ---------------------------------------------------------------------------
 
 export const dcsTools: ToolDefinition<any, DcsToolContext>[] = [
+  searchDcsKnowledgeTool,
   investigateDcsCodeTool,
   queryDcsDataTool,
 ];

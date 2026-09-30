@@ -292,8 +292,143 @@ section("W5. reset 与新实例");
 }
 
 // ---------------------------------------------------------------------------
+// 场景 W6：处理中 reset 竞争（409 拒绝 + 不创建第二个 Agent + 完成后可重置）
+// ---------------------------------------------------------------------------
 
-server.close();
+section("W6. 处理中 reset 竞争修复");
+
+{
+  const releaser: { fn?: () => void } = {};
+  agentImpl = async () => {
+    await new Promise<void>((r) => {
+      releaser.fn = r;
+    });
+    return "慢回答";
+  };
+  // 空闲状态先重置，确保从干净实例开始
+  await fetch(`${base}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+
+  const first = fetch(`${base}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ question: "慢请求" }),
+  });
+  await sleep(50); // 等第一个 Run 占住 busy
+
+  // 处理中 reset → 409
+  const resetResp = await fetch(`${base}/api/reset`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const resetData = (await resetResp.json()) as { ok: boolean; message?: string };
+  check(
+    "W6a 处理中 reset 被拒绝（409 + ok:false + 提示语）",
+    resetResp.status === 409 && resetData.ok === false && (resetData.message ?? "").includes("正在处理中"),
+    `status=${resetResp.status} body=${JSON.stringify(resetData)}`
+  );
+
+  // 409 之后实例保留：随后提问应收到 busy（同一个 Agent，不创建第二个）
+  const before = createAgentCalls;
+  const duringBusy = await fetch(`${base}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ question: "被拒后的插队问题" }),
+  });
+  const busyEvents = await readSse(duringBusy);
+  check(
+    "W6b 拒绝重置后实例与 busy 状态保留（再次提问收到 busy，未创建第二个 Agent）",
+    busyEvents.some((e) => e.type === "busy") && createAgentCalls === before,
+    `busy=${String(busyEvents.some((e) => e.type === "busy"))} agents=${createAgentCalls - before}`
+  );
+
+  // 原请求完成后 → reset 成功 → 新实例创建
+  releaser.fn?.();
+  const firstResp = await first;
+  const firstEvents = await readSse(firstResp);
+  check("W6c 原慢请求正常完成（final 到达，busy 解除）", firstEvents.some((e) => e.type === "final" && e.text === "慢回答"));
+
+  const reset2 = await fetch(`${base}/api/reset`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const reset2Data = (await reset2.json()) as { ok: boolean };
+  check("W6d 原请求完成后 reset 成功（200 + ok:true）", reset2.status === 200 && reset2Data.ok === true);
+
+  agentImpl = undefined;
+  const newChat = await fetch(`${base}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ question: "重置后的新会话第一问" }),
+  });
+  await readSse(newChat);
+  check("W6e 重置后再次提问创建新 Agent 实例", createAgentCalls === before + 1, `calls=${createAgentCalls}`);
+}
+
+// ---------------------------------------------------------------------------
+// 场景 W7：超时清理只删除本次运行实例（独立短预算服务器验证）
+// ---------------------------------------------------------------------------
+
+section("W7. 超时清理不误删新实例（discardEntryIfCurrent）");
+
+{
+  // 慢 Agent：每次 prompt 挂起直到测试手动 resolve；迟到 resolve 后无任何输出
+  let w7AgentCalls = 0;
+  const resolvers: Array<() => void> = [];
+  const server7 = createWebServer({
+    resolveIdentity: async (code) => (code === "10086" ? TEST_IDENTITY : null),
+    createAgent: () => {
+      w7AgentCalls++;
+      return new FakeAgent(async (_q) => {
+        await new Promise<void>((r) => {
+          resolvers.push(r);
+        });
+        return "迟到但无人接收的回答";
+      });
+    },
+    budgetMs: 120, // 短预算触发超时路径
+    staticDir: fileURLToPath(new URL("../../DCS Agent.web", import.meta.url)),
+    logger: () => undefined,
+  });
+  await new Promise<void>((resolve) => server7.listen(0, resolve));
+  const base7 = `http://127.0.0.1:${(server7.address() as AddressInfo).port}`;
+
+  const sResp = await fetch(`${base7}/api/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: "10086" }),
+  });
+  const sData = (await sResp.json()) as { token?: string };
+  const token7 = sData.token ?? "";
+
+  const chat1 = await fetch(`${base7}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token7}` },
+    body: JSON.stringify({ question: "会超时的问题" }),
+  });
+  const events1 = await readSse(chat1);
+  check("W7a 超时触发 timeout 事件", events1.some((e) => e.type === "timeout"), JSON.stringify(events1.map((e) => e.type)));
+
+  // 超时后立即新建会话提问（新实例）；随后旧 Run 迟到 resolve + 旧连接关闭
+  const chat2Resp = fetch(`${base7}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token7}` },
+    body: JSON.stringify({ question: "超时后的新问题" }),
+  });
+  await sleep(50);
+  resolvers[0]?.(); // 仅释放旧 Run 的挂起（迟到 resolve；新会话继续等待自己的超时）
+  const chat2 = await chat2Resp;
+  const events2 = await readSse(chat2);
+
+  check(
+    "W7b 旧 Run 迟到结果未发送给新会话（新回复不含迟到内容）",
+    !events2.some((e) => e.type === "final" && String(e.text).includes("迟到")),
+    JSON.stringify(events2.map((e) => e.type))
+  );
+  check("W7c 超时废弃后新提问创建了新实例", w7AgentCalls === 2, `calls=${w7AgentCalls}`);
+  server7.close();
+}
+
+// ---------------------------------------------------------------------------
 
 console.log(`\n========== Web Channel 测试结果 ==========`);
 console.log(`通过 ${passed} 项，失败 ${failed} 项`);
