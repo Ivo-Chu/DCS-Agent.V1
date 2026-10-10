@@ -1,8 +1,9 @@
+process.env.LLM_BASE_URL = "http://localhost:8000/v1";
 // test/cli-fixture.mjs — CLI 展示层验证用的本地假模型（无外部请求）。
 // 模式由环境变量 CLI_PROBE 决定：
 // - length：模型只发工具调用片段且 finish_reason=length（R3：截断说明必须显示到终端）
 // - args：模型用内部路径作检索关键词（R4：参数与摘要不得明文显示路径）
-process.env.DEEPSEEK_API_KEY = "cli-display-fixture";
+process.env.LLM_API_KEY = "cli-display-fixture";
 const mode = process.env.CLI_PROBE;
 let call = 0;
 const frame = (delta, finish_reason) =>

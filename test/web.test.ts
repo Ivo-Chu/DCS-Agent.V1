@@ -1,6 +1,6 @@
 /**
  * Web Channel 层确定性测试。
- * 注入假身份解析与假 Agent，不依赖 DeepSeek / Oracle / 真实身份数据；
+ * 注入假身份解析与假 Agent，不依赖 LLM / Oracle / 真实身份数据；
  * 通过真实 HTTP（随机端口）验证静态页、建档、鉴权、SSE 流式问答、
  * busy 拒绝、reset 丢弃实例。
  *

@@ -29,7 +29,7 @@ import type {
   ToolOutput,
   ToolSchema,
 } from "../src/core/types.ts";
-import { createDeepSeekStreamFn } from "../src/core/model/deepseek.ts";
+import { createOpenAiStreamFn } from "../src/core/model/openai-compatible.ts";
 import { maskPii, createDcsToolHooks } from "../src/dcs/hooks.ts";
 import { createMockSession, type DcsToolContext } from "../src/dcs/session.ts";
 import {
@@ -612,17 +612,17 @@ section("G. 停止策略（maxTurns 用尽 / StreamFn error 契约）");
   const t2 = await agent2.prompt("会崩吗");
   check("G3 StreamFn 抛异常被编码为 stopReason:error（Run 不崩溃）", t2.includes("违反契约") && errors.length === 1);
 
-  // G3: 真实 DeepSeek StreamFn 的 error 契约（无 key → 立即 error，绝不 reject）
-  const noKeyFn = createDeepSeekStreamFn({ apiKey: "" });
+  // G3: 真实 LLM StreamFn 的 error 契约（无 key → 立即 error，绝不 reject）
+  const noKeyFn = createOpenAiStreamFn({ apiKey: "" });
   let gotError = false;
   let gotOther = false;
   for await (const ev of noKeyFn({ systemPrompt: "s", messages: [], tools: [] })) {
     if (ev.type === "message_end" && ev.stopReason === "error") gotError = true;
     else gotOther = true;
   }
-  check("G4 DeepSeek StreamFn 无 key 时产出 stopReason:error（永不 reject）", gotError && !gotOther);
+  check("G4 LLM StreamFn 无 key 时产出 stopReason:error（永不 reject）", gotError && !gotOther);
 
-  const badUrlFn = createDeepSeekStreamFn({ apiKey: "sk-test", baseUrl: "http://127.0.0.1:1" });
+  const badUrlFn = createOpenAiStreamFn({ apiKey: "sk-test", baseUrl: "http://127.0.0.1:1" });
   let netError = "";
   for await (const ev of badUrlFn({ systemPrompt: "s", messages: [], tools: [] })) {
     if (ev.type === "message_end" && ev.stopReason === "error") netError = ev.errorMessage ?? "";
@@ -644,7 +644,7 @@ async function sseEvents(body: string): Promise<ModelStreamEvent[]> {
     })) as typeof fetch;
   try {
     const events: ModelStreamEvent[] = [];
-    for await (const ev of createDeepSeekStreamFn({ apiKey: "fixture" })({
+    for await (const ev of createOpenAiStreamFn({ apiKey: "fixture", baseUrl: "http://localhost:8000/v1" })({
       systemPrompt: "s",
       messages: [],
       tools: [],
@@ -714,7 +714,7 @@ function sseFrame(delta: Record<string, unknown>, finish: string | null = null):
   try {
     const events: ModelStreamEvent[] = [];
     const collecting = (async () => {
-      for await (const ev of createDeepSeekStreamFn({ apiKey: "fixture" })({
+      for await (const ev of createOpenAiStreamFn({ apiKey: "fixture", baseUrl: "http://localhost:8000/v1" })({
         systemPrompt: "s",
         messages: [],
         tools: [],
@@ -767,7 +767,7 @@ section("I. length 截断（F2 回归：残缺 toolCalls 不入历史、序列�
     return new Response(sseFrame({ content: "ok" }, "stop"));
   }) as typeof fetch;
   try {
-    const fn = createDeepSeekStreamFn({ apiKey: "fixture" });
+    const fn = createOpenAiStreamFn({ apiKey: "fixture", baseUrl: "http://localhost:8000/v1" });
     const next: AgentMessage = { role: "user", content: "下一问" };
     for await (const _ev of fn({ systemPrompt: "s", messages: [...agent.context, next], tools: [] })) {
       void _ev;

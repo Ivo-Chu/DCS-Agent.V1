@@ -3,7 +3,7 @@
  *
  * 与离线验收录（test/acceptance.ts + smoke 场景 K）完全分离：
  * - 离线：FakeStreamFn 剧本 + 模拟事实判定（42 元 / 35 元 / 驳回），验证接线；
- * - 本入口：真实 DeepSeek + 真实 Oracle + 真实员工身份（resolveEmployeeByCode，
+ * - 本入口：真实 LLM + 真实 Oracle + 真实员工身份（resolveEmployeeByCode，
  *   不回退模拟身份），验证真实业务行为；业务正确性只标记 PENDING_REVIEW，
  *   由人工按 expectedFacts 核对——正常结束 / 调用过工具 / 命中关键词
  *   都不等于业务验收通过。
@@ -14,10 +14,11 @@
  * 运行状态：
  * - COMPLETED：正常生成最终回答（业务正确性 → PENDING_REVIEW 待人工核对）
  * - FAILED：运行异常、案例超时、非自然结束、会话内混用不同员工、工号无法解析
- * - SKIPPED：未配置 DEEPSEEK_API_KEY / DCS_DB_* / 案例文件缺失或全为占位符
+ * - SKIPPED：未配置 LLM_API_KEY / DCS_DB_* / 案例文件缺失或全为占位符
  *
  * 运行：npm run test:accept:live
  */
+import { loadEnvLocal } from "../src/dcs/env-local.ts";
 import * as path from "node:path";
 import type { AgentEvent } from "../src/core/events.ts";
 import { createDcsAgent, type DcsAgentHolder } from "../src/dcs/agent-factory.ts";
@@ -40,8 +41,10 @@ const REPORTS_DIR = path.resolve(import.meta.dirname, "acceptance-cases", "repor
 const TOTAL_BUDGET_MS = 10 * 60 * 1000;
 
 async function main(): Promise<void> {
+  loadEnvLocal();
   const missing: string[] = [];
-  if (!process.env.DEEPSEEK_API_KEY) missing.push("DEEPSEEK_API_KEY");
+  if (!process.env.LLM_API_KEY) missing.push("LLM_API_KEY");
+  if (!process.env.LLM_BASE_URL) missing.push("LLM_BASE_URL");
   for (const k of ["DCS_DB_USER", "DCS_DB_PASSWORD", "DCS_DB_CONNECT_STRING"]) {
     if (!process.env[k]) missing.push(k);
   }

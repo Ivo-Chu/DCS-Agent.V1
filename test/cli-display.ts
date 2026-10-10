@@ -31,7 +31,7 @@ function runCli(mode: string, input: string): { stdout: string; stderr: string }
     ["--import", "tsx", "--import", "./test/cli-fixture.mjs", "src/index.ts"],
     {
       cwd: process.cwd(),
-      env: { ...process.env, CLI_PROBE: mode, DEEPSEEK_API_KEY: "cli-display-fixture" },
+      env: { ...process.env, CLI_PROBE: mode, LLM_API_KEY: "cli-display-fixture" },
       input,
       encoding: "utf8",
       timeout: 30000,

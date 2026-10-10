@@ -10,7 +10,7 @@
  *
  * 环境变量：
  *   WECOM_BOT_ID / WECOM_BOT_SECRET  机器人长连接凭据
- *   DEEPSEEK_API_KEY                  模型密钥
+ *   LLM_API_KEY                  模型密钥
  *   WECOM_RUN_BUDGET_MS               Agent 处理预算（默认 90000）
  *   DCS_IDENTITY_FILE                 身份映射文件（默认 ./identity.json）
  *
@@ -62,9 +62,9 @@ async function main(): Promise<void> {
     console.error('PowerShell：$env:WECOM_BOT_ID = "xxxx"；$env:WECOM_BOT_SECRET = "xxxx"');
     process.exit(1);
   }
-  if (!process.env.DEEPSEEK_API_KEY) {
-    console.error("未设置 DEEPSEEK_API_KEY，无法启动。");
-    console.error('PowerShell：$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"');
+  if (!process.env.LLM_API_KEY) {
+    console.error("未设置 LLM_API_KEY，无法启动。");
+    console.error('PowerShell：$env:LLM_API_KEY = "sk-xxxxxxxx"');
     process.exit(1);
   }
 

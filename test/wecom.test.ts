@@ -1,7 +1,7 @@
 /**
  * Channel 层确定性测试（Step 5/6/7/8 + §11 话术卫生）。
  * 全部使用注入的假动作 / 假 Agent / 可控时钟与定时器，不依赖 WeCom SDK、
- * DeepSeek 或真实身份数据。
+ * LLM 或真实身份数据。
  *
  * 运行：npm run test:wecom
  */

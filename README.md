@@ -32,7 +32,7 @@ dcs-agent/
 │   │   ├── agent.ts          # Agent：状态持有 + prompt() + subscribe()
 │   │   ├── agent-loop.ts     # AgentLoop：无状态单次 Run 执行器
 │   │   └── model/
-│   │       └── deepseek.ts   # DeepSeek 客户端（OpenAI 兼容，SSE 流式）
+│   │       └── openai-compatible.ts   # OpenAI 兼容客户端（Qwen3.5-35B，SSE 流式）
 │   ├── dcs/                  # DCS Domain Layer（业务、身份、安全）
 │   │   ├── session.ts        # SessionUser / DcsSession / DcsToolContext + Mock 会话
 │   │   ├── prompt.ts         # systemPrompt 定稿文案 + 当前员工身份注入
@@ -42,7 +42,7 @@ dcs-agent/
 └── test/
     ├── smoke.ts              # 42 项冒烟测试（FakeStreamFn，无需 API key）
     ├── acceptance.ts         # 三个验收场景端到端脚本
-    └── deepseek-live.ts      # DeepSeek 真实 key 单测（需环境变量）
+    └── llm-live.ts      # LLM 真实 key 单测（需环境变量）
 ```
 
 **分层铁律**：`core` 中不出现任何 DCS / 企微 / 工号 / 脱敏规则等业务概念（已 grep 验证：仅注释中作为举例提及）。DCS 相关的 Session、Prompt、工具、脱敏全部在 `dcs` 层实现与组装。
@@ -123,13 +123,27 @@ Emitter 为同步实现，单个消费者异常不阻断事件流。不实现 `t
 
 ---
 
-## 4. 模型接入（core/model/deepseek.ts）
+## 4. 模型接入（core/model/openai-compatible.ts）
 
 - OpenAI 兼容 `/chat/completions` 接口，SSE 流式解析（逐行 `data:` 前缀，支持 `[DONE]`、`tool_calls` 增量聚合）
-- 可配置：`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`（默认 `https://api.deepseek.com`）/ `DEEPSEEK_MODEL`（默认 `deepseek-chat`）
+- 可配置：`LLM_API_KEY` / `LLM_BASE_URL`（必填，填写部署方提供的 Base URL，含 `/v1`）/ `LLM_MODEL`（默认 `Qwen3.5-35B`）
+- CLI / Web / 企微统一经 `createDcsAgent → createOpenAiStreamFn → fetch` 调用模型，旧 `DEEPSEEK_*` 不再读取；迁移时将本机配置改为 `LLM_*`。
+- 含工具时显式发送 `tool_choice: "auto"`；模型名为 `Qwen3.5-35B` 时发送 `chat_template_kwargs: {"enable_thinking": false}`。不添加采样参数。
 - **v1 错误契约**：StreamFn 永不抛异常、永不 reject；API / 网络 / SSE / 鉴权失败统一编码为 `stopReason:"error"`，错误说明置于 `message_end.errorMessage`，由 AgentLoop 转写为错误 AssistantMessage 并终止 Run
 - `AgentMessage → OpenAI messages` 的角色转换只发生在此处（LLM 调用边界）：`user→user`、`assistant(+toolCalls)→assistant`、`toolResult→tool`
 - 双保险：即使 StreamFn 违反契约抛异常，AgentLoop 也会兜住并编码为 error，Run 不崩溃（冒烟测试 G3 验证）
+
+本次迁移实测（2026-10-09）：
+
+- **PASS**：集团接口普通对话 HTTP 200、非流式原生自动工具调用、真实 SSE 分片、工具结果关联回填；现有适配器无需改动 SSE 解析器。
+- **PASS（迁移工作树首次验证）**：`npm run typecheck`、`npm run check`、`npm run test:live`、`npm run dev` 普通问答（无工具调用）。Web 测试依赖同级真实前端目录，隔离工作树需准备该目录；不修改测试断言。
+- **PASS（链路）**：现有工厂 + Runtime 实际执行源码调查（限定具体方法，两次调用）和知识库检索（明确指定文档，一次调用），工具结果回填后自然结束，无同一调用 ID 重复执行。使用 CLI 原有模拟身份，不代表真实员工验收。
+- **PASS（上下文/错误接线）**：菜单权限问题触发真实数据库工具，缺数据库配置返回错误后仍生成答复；随后追问“那这个权限该怎么开通？”保留上文语境。该结果不证明数据库事实或业务回答正确。
+- **FAIL（D 盘同步后复测）**：`npm run test:live` 的 DCS 工具场景 2e 未调用工具，直接从普通员工角色推断无权限；其余文本、虚拟工具 SSE、结果回填和错误契约通过。保留严格断言，当前 live 总结果为 FAIL；先前 PASS 仅代表当次结果。
+- **FAIL（行为）**：独立会话询问“请查询知识库，告诉我 DCS 权限申请的操作流程，并保留出处。”时，一次未执行检索便生成流程及虚构出处；明确要求调用工具检索指定文档的另一次测试通过，不能覆盖此失败。
+- **FAIL（长会话）**：菜单权限、多轮追问后继续广泛源码调查，15 次源码调用后超过服务端 32,768 token 上限，返回 HTTP 400；错误被编码为 error，后续同会话也因超限失败。本次不添加压缩或修改上下文机制。
+- **UNVERIFIED**：真实数据库权限、真实员工案例驱动验收及 Web/企微真人端到端。`test:accept:live` 实际因缺 "DCS_DB_*" 跳过，真实案例也未准备。代码迁移已实施，但整体验收尚未通过。
+
 
 ---
 
@@ -268,24 +282,24 @@ npm run test:factory         # Agent 组装工厂测试（拦截 fetch 验证取
 npm run test:accept:harness  # 真实业务验收 harness 离线测试（案例加载/会话隔离/结果分类）
 npm run test:knowledge      # 知识库全链路测试（真实 LanceDB 临时库 + mock 集团接口，无需配置）
 npm run knowledge:ingest    # 知识库资料导入/更新（需 DCS_EMBEDDING_*，见 §6.1）
-npm run test:live            # DeepSeek 真实 key 适配器单测（需 DEEPSEEK_API_KEY）
+npm run test:live            # LLM 真实 key 适配器单测（需 LLM_API_KEY）
 npm run test:live:db         # 真实 Oracle 库验证（需 DCS_DB_* 三变量，未配置优雅 SKIPPED）
 npm run test:accept:live     # 真实业务验收（真实员工身份 + 真实库 + 真实模型，案例驱动，见 §7.5）
-npm run dev                  # CLI REPL（需 DEEPSEEK_API_KEY；默认模拟身份）
+npm run dev                  # CLI REPL（需 LLM_API_KEY；默认模拟身份）
 npm run wecom:echo           # 企业微信长连接 Echo（需 WECOM_BOT_ID / WECOM_BOT_SECRET）
-npm run wecom:bot            # 企业微信机器人（需 WECOM 凭据 + DEEPSEEK_API_KEY）
-npm run web                  # 网页端（需 DEEPSEEK_API_KEY + DCS_DB_*）
+npm run wecom:bot            # 企业微信机器人（需 WECOM 凭据 + LLM_API_KEY）
+npm run web                  # 网页端（需 LLM_API_KEY + DCS_DB_*）
 ```
 
-**环境变量不会自动加载**：本项目不读取 .env 文件（无 dotenv），所有变量须在 shell 中设置（PowerShell：`$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"`；bash：`export DEEPSEEK_API_KEY="sk-xxxxxxxx"`），仅当前窗口有效。
+**本地配置加载**：CLI、Web、企微、模型 live 测试与业务验收读取项目根目录 `.env.local`，复用 `src/dcs/env-local.ts`，系统环境变量优先。值不加引号、不带行尾注释；不读取 `.env`，不依赖 dotenv。内部地址与密钥只放在被 Git 忽略的 `.env.local` 或系统环境变量中。
 
 ### 7.2 环境变量
 
 | 变量 | 必需 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | dev / test:live | DeepSeek API 密钥，未设置时 CLI 与 live 测试优雅退出 |
-| `DEEPSEEK_BASE_URL` | 否 | 默认 `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-chat` |
+| `LLM_API_KEY` | 所有模型入口 | Bearer 密钥，缺失时入口拒绝启动；live 测试标记未验证 |
+| `LLM_BASE_URL` | 是 | 部署方提供的 Base URL（含 `/v1`），无默认地址 |
+| `LLM_MODEL` | 否 | 默认 `Qwen3.5-35B` |
 | `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
 | `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
 | `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（指向本机 DCS 源码树，具体路径不入库）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
@@ -336,7 +350,7 @@ npm run web                  # 网页端（需 DEEPSEEK_API_KEY + DCS_DB_*）
 启动：
 
 ```powershell
-$env:WECOM_BOT_ID = "xxxx"; $env:WECOM_BOT_SECRET = "xxxx"; $env:DEEPSEEK_API_KEY = "sk-xxxx"
+$env:WECOM_BOT_ID = "xxxx"; $env:WECOM_BOT_SECRET = "xxxx"; $env:LLM_API_KEY = "sk-xxxx"
 npm run wecom:bot
 ```
 
@@ -366,7 +380,7 @@ npm run wecom:bot
 启动：
 
 ```powershell
-$env:DEEPSEEK_API_KEY = "sk-xxxx"; $env:DCS_DB_USER="xxx"; $env:DCS_DB_PASSWORD="xxx"; $env:DCS_DB_CONNECT_STRING="host:1521/SVC"
+$env:LLM_API_KEY = "sk-xxxx"; $env:DCS_DB_USER="xxx"; $env:DCS_DB_PASSWORD="xxx"; $env:DCS_DB_CONNECT_STRING="host:1521/SVC"
 npm run web   # http://localhost:8787
 ```
 
@@ -385,16 +399,16 @@ npm run web   # http://localhost:8787
 | **身份链路真人验收**（企微"我是谁" → S2_Employee 数据库解析，13:33） | ✅ 2026-09-24 通过（真实工号/姓名/部门返回，schema 自动发现生效；中途 NJS-530 为用户侧网络变化，非代码问题） |
 | Channel 层（wecom.test.ts：即时处理状态机/隔离/去重/超时/迟到丢弃/话术卫生） | ✅ 28/28 |
 | Web Channel 层（web.test.ts：静态页/建档/鉴权/SSE 流式/busy 拒绝/reset/处理中 reset 409/超时清理不误删新实例） | ✅ 23/23（2026-09-28 更新，以实际运行输出为准） |
-| Agent 组装工厂（agent-factory.test.ts：拦截 fetch 验证取消信号真实接线/新旧 Run 信号隔离） | ✅ 9/9（2026-09-28 新增） |
+| Agent 组装工厂（agent-factory.test.ts：拦截 fetch 验证取消信号真实接线/新旧 Run 信号隔离） | ✅ 12/12（2026-10-09，含 Qwen 请求参数与三个工具保留检查） |
 | 验收 harness（acceptance-harness.test.ts：案例加载跳过/会话复用与身份隔离/结果分类/报告渲染） | ✅ 21/21（2026-09-28 新增） |
 | 知识库全链路（knowledge.test.ts：配置门控/分块规则/Embedding与Rerank客户端校验/导入增量同步/原子更新与维度校验/孤儿清理/配置不匹配拒开/检索→重排→出处格式/同义检索/降级/取消/完整片段不截断/长度控制） | ✅ 55/55（2026-09-29 审查修复后，真实 LanceDB 临时库 + mock 集团接口） |
 | 企微长连接 Echo（Step 1，真实联调） | ✅ 2026-09-22 通过（真实 userid/msgid/回复送达） |
 | core 纯净度（无 DCS import） | ✅ grep 验证 |
 | 验收判定对抗（smoke 场景 K：错误字符串含关键词必须 FAIL） | ✅ 4/4 |
-| DeepSeek 真实 key 适配器单测（test:live） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` |
+| LLM 真实接口适配器单测（test:live） | ⚠ 2026-10-09 首次 PASS；D 盘同步后复测 **FAIL**：DCS 场景 2e 未调用工具；其余接口项目通过，见 §4 |
 | 真实 Oracle 库验证（test:live:db，L-DB1~4：DUAL/数据字典/UPDATE 拒绝/ORA 透传） | ✅ 2026-09-24 通过（连接 / 数据字典 / 护栏 / 错误透传 4/4） |
-| 真实 DeepSeek 验收（test:accept:live，2026-09-28 重建为案例驱动真实业务验收） | ⏸ **未验证（SKIPPED）**——缺 `DEEPSEEK_API_KEY` / `DCS_DB_*` / 真实案例（cases.json 待填写，见 §7.5） |
-| 知识库真实链路（集团真实 Embedding/Rerank 接口 + 真实文档导入 → 检索 → Agent 回答含出处） | ⏸ **未验证**——缺集团接口地址与凭据配置（见 §9.9）；离线 46/46 已过，配置后 `npm run knowledge:ingest` 即可启用 |
+| 真实 LLM 验收（test:accept:live，2026-09-28 重建为案例驱动真实业务验收） | ⏸ **未验证（SKIPPED）**——当前缺 `DCS_DB_*` / 真实案例（cases.json 待填写，见 §7.5） |
+| 知识库真实链路（集团接口 + 已导入文档 → 检索 → Agent 回答含出处） | ⚠ 2026-10-09：明确指定检索文档时真实闭环通过；自然问法出现未检索却生成流程和虚构出处，行为验收 **FAIL**，见 §4 |
 | 企微→Agent→回复 端到端（Step 9 真人验收） | ⏸ **未验证**——需凭据配置后真人测试 |
 
 冒烟测试验证点：prompts / context / newMessages 边界与调用方数组不可变性、多 Turn 循环、ToolCall→execute→ToolResult→下一轮 LLM 回填、Agent 状态写回、脱敏管线（含"脱敏发生在回填模型之前"）、beforeToolCall 阻断扩展点、maxTurns 保护（含耗尽时终止说明）、StreamFn 永不 reject 契约，以及审查回归：SSE 坏帧 / 无 finish_reason EOF 编码为 error（H1–H5）、length 截断残缺 toolCalls 剥离与序列化配对（I1–I6）、Hook 异常兜底不泄原文 / 不击穿 Run（J1–J7）。
@@ -467,7 +481,7 @@ harness 离线测试（`npm run test:accept:harness`）覆盖案例加载跳过�
 
 ### 9.2 其余偏差
 
-1. **真实 key 验证未执行**：`DEEPSEEK_API_KEY` 未设置，§12 步骤 2（真实 key 单测）与步骤 5（CLI 真实三问）**未验证（SKIPPED）**，不以假模型代替；`test:live` / `test:accept:live` / `dev` 脚本已就绪，key 到位即可执行。
+1. **模型验证更新（2026-10-09）**：Qwen3.5-35B 原生自动工具调用、SSE、结果回填与 CLI 普通问答已通过；真实员工菜单权限与案例驱动验收仍为 **UNVERIFIED**，当前缺数据库配置与真实案例。
 2. **maxTurns 默认值**（方案未定值，CLI 显式传 8）。
 3. **search_dcs_code 支持 `DCS_SOURCE_ROOT` 覆盖**：为测试可移植性所做的最小调整。
 4. ~~菜单匹配含包含式兜底~~（已随 Legacy Mock 工具删除而不复存在，2026-09-24）。
@@ -490,7 +504,7 @@ harness 离线测试（`npm run test:accept:harness`）覆盖案例加载跳过�
 
 已知遗留：
 
-1. **live 验收（含场景 4 核心验收 Case："黄石智通已勾选无需协调员…"源码自主调查）未执行**——缺会话级 `DEEPSEEK_API_KEY` 与 `DCS_SOURCE_ROOT`；
+1. **live 验收（含场景 4 核心验收 Case："黄石智通已勾选无需协调员…"源码自主调查）未执行**——该指定业务案例仍为 **UNVERIFIED**；2026-10-09 模型接口已验证，不能代替该案例验收；
 2. **多轮源码调查可能逼近企微 90s 预算**（首次调查约 10s + 模型思考），必要时调 `WECOM_RUN_BUDGET_MS`；Channel 层本轮不动；
 3. ~~**"我有哪些菜单"的回答错误问题（P0）本轮未修**~~——已随 Legacy Mock 工具删除统一解决（2026-09-24，见 §9.4）；
 4. node_modules 曾缺失 `@wecom/aibot-node-sdk`（环境问题，已按 lockfile 补装）。
@@ -597,11 +611,13 @@ npm install
 # 1. 离线检查（无需任何凭据；任一失败非零退出）
 npm run check
 
-# 2. CLI 真实模型调试（默认模拟身份；环境变量需在 shell 设置，不自动加载 .env）
+# 2. CLI 真实模型调试（默认模拟身份；优先按 .env.example 配置 .env.local）
 # PowerShell：
-$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"
+$env:LLM_API_KEY = "sk-xxxxxxxx"
+$env:LLM_BASE_URL = "https://your-model-host/v1"
 # bash：
-# export DEEPSEEK_API_KEY="sk-xxxxxxxx"
+# export LLM_API_KEY="sk-xxxxxxxx"
+# export LLM_BASE_URL="https://your-model-host/v1"
 npm run dev
 
 # 3. 真实业务验收（真实员工身份 + 真实库 + 真实模型，见 §7.5）
@@ -610,4 +626,4 @@ $env:DCS_DB_USER="xxx"; $env:DCS_DB_PASSWORD="xxx"; $env:DCS_DB_CONNECT_STRING="
 npm run test:accept:live
 ```
 
-扩展指引：加工具 → `dcs/tools.ts` 实现 `ToolDefinition<Args, DcsToolContext>` 并加入 `dcsTools`；换模型 → 实现 `StreamFn` 契约替换 `deepseek.ts`；组装 Agent → 一律走 `dcs/agent-factory.ts` 的 `createDcsAgent`（不要在 Channel 层手写 new Agent）。
+扩展指引：加工具 → `dcs/tools.ts` 实现 `ToolDefinition<Args, DcsToolContext>` 并加入 `dcsTools`；换模型 → 实现 `StreamFn` 契约替换 `openai-compatible.ts`；组装 Agent → 一律走 `dcs/agent-factory.ts` 的 `createDcsAgent`（不要在 Channel 层手写 new Agent）。

@@ -1,6 +1,6 @@
 /**
- * core/model/deepseek.ts
- * DeepSeek 客户端（OpenAI 兼容接口，SSE 流式）。
+ * core/model/openai-compatible.ts
+ * OpenAI 兼容客户端（OpenAI 兼容接口，SSE 流式）。
  *
  * v1 契约（与方案 §4 一致）：
  * StreamFn 永不抛异常、永不 reject；
@@ -16,7 +16,7 @@ import type {
   ToolSchema,
 } from "../types.ts";
 
-export interface DeepSeekOptions {
+export interface OpenAiStreamOptions {
   apiKey?: string;
   baseUrl?: string;
   model?: string;
@@ -85,18 +85,18 @@ function mapFinishReason(reason: string | null | undefined): "stop" | "length" |
   return "stop";
 }
 
-export function createDeepSeekStreamFn(options: DeepSeekOptions = {}): StreamFn {
-  const apiKey = options.apiKey ?? process.env.DEEPSEEK_API_KEY ?? "";
+export function createOpenAiStreamFn(options: OpenAiStreamOptions = {}): StreamFn {
+  const apiKey = options.apiKey ?? process.env.LLM_API_KEY ?? "";
   const baseUrl =
-    options.baseUrl ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
-  const model = options.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
+    options.baseUrl ?? process.env.LLM_BASE_URL ?? "";
+  const model = options.model ?? process.env.LLM_MODEL ?? "Qwen3.5-35B";
 
   return async function* stream(req): AsyncGenerator<ModelStreamEvent> {
-    if (!apiKey) {
+    if (!apiKey || !baseUrl) {
       yield {
         type: "message_end",
         stopReason: "error",
-        errorMessage: "模型调用失败：未配置 DEEPSEEK_API_KEY",
+        errorMessage: `模型调用失败：未配置 ${!apiKey ? "LLM_API_KEY" : "LLM_BASE_URL"}`,
       };
       return;
     }
@@ -106,7 +106,11 @@ export function createDeepSeekStreamFn(options: DeepSeekOptions = {}): StreamFn 
       messages: toOpenAiMessages(req.systemPrompt, req.messages),
       stream: true,
     };
+    if (model === "Qwen3.5-35B") {
+      body.chat_template_kwargs = { enable_thinking: false };
+    }
     if (req.tools.length > 0) {
+      body.tool_choice = "auto";
       body.tools = req.tools.map((t: ToolSchema) => ({
         type: "function",
         function: {

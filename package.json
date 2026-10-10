@@ -18,7 +18,7 @@
     "test:factory": "tsx test/agent-factory.test.ts",
     "test:identity": "tsx test/identity.test.ts",
     "test:knowledge": "tsx test/knowledge.test.ts",
-    "test:live": "tsx test/deepseek-live.ts",
+    "test:live": "tsx test/llm-live.ts",
     "test:live:db": "tsx test/live-db.ts",
     "test:web": "tsx test/web.test.ts",
     "test:wecom": "tsx test/wecom.test.ts",

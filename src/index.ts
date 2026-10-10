@@ -1,7 +1,7 @@
 /**
  * DCS Agent v1 — CLI REPL 入口。
  * 组装 core（Agent Runtime）与 dcs（Domain Layer）：
- * DcsSession + DCS Prompt + DCS Tools + DCS Hooks + DeepSeek StreamFn + Agent。
+ * DcsSession + DCS Prompt + DCS Tools + DCS Hooks + LLM StreamFn + Agent。
  */
 import * as readline from "node:readline";
 import { createDcsAgent } from "./dcs/agent-factory.ts";
@@ -15,10 +15,10 @@ import { closeDbClient } from "./dcs/db/client.ts";
 const INTERNAL_SEARCH_TOOL = "investigate_dcs_code";
 
 async function main(): Promise<void> {
-  if (!process.env.DEEPSEEK_API_KEY) {
-    console.error("未设置环境变量 DEEPSEEK_API_KEY，无法启动 DCS Agent。");
-    console.error('PowerShell：$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"');
-    console.error('bash：export DEEPSEEK_API_KEY="sk-xxxxxxxx"');
+  if (!process.env.LLM_API_KEY) {
+    console.error("未设置环境变量 LLM_API_KEY，无法启动 DCS Agent。");
+    console.error('PowerShell：$env:LLM_API_KEY = "sk-xxxxxxxx"');
+    console.error('bash：export LLM_API_KEY="sk-xxxxxxxx"');
     process.exit(1);
   }
 

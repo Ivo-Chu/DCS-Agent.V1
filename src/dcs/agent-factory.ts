@@ -16,7 +16,7 @@
  * 不新增框架层：就是一次函数调用，CLI / Web / 企微 / 验收脚本共用。
  */
 import { Agent } from "../core/agent.ts";
-import { createDeepSeekStreamFn } from "../core/model/deepseek.ts";
+import { createOpenAiStreamFn } from "../core/model/openai-compatible.ts";
 import type { StreamFn } from "../core/types.ts";
 import { createDcsToolHooks } from "./hooks.ts";
 import { buildSystemPrompt } from "./prompt.ts";
@@ -33,7 +33,7 @@ export interface CreateDcsAgentOptions {
   session: DcsSession;
   /** 取消信号持有器：与 Channel 层运行时替换/abort 的是同一个对象。 */
   holder: DcsAgentHolder;
-  /** 测试注入的假模型；缺省为真实 DeepSeek（读取环境变量）。 */
+  /** 测试注入的假模型；缺省为真实 LLM（读取环境变量）。 */
   streamFn?: StreamFn;
   /** 单 Run 最大轮数，默认 24（测试期宽松安全阀，非生产参数）。 */
   maxTurns?: number;
@@ -48,7 +48,7 @@ export function createDcsAgent(opts: CreateDcsAgentOptions): Agent<DcsToolContex
     tools: dcsTools,
     // signalProvider 每次模型调用求值：holder.controller 被 Channel 层替换后，
     // 下一轮模型请求立即使用新信号；被 abort 后旧 Run 无法再发起新请求
-    streamFn: streamFn ?? createDeepSeekStreamFn({
+    streamFn: streamFn ?? createOpenAiStreamFn({
       signalProvider: () => holder.controller.signal,
     }),
     // holder 同时进入 toolContext：search_dcs_knowledge 等需要外部请求的工具

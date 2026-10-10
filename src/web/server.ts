@@ -21,7 +21,7 @@
  *
  * 环境变量：WEB_PORT（默认 8787）、WEB_RUN_BUDGET_MS（默认 90000）、
  *           WEB_STATIC_DIR（前端静态目录，默认 ../DCS Agent.web）、
- *           DEEPSEEK_API_KEY（必需）、DCS_DB_*（身份与数据查询）。
+ *           LLM_API_KEY（必需）、DCS_DB_*（身份与数据查询）。
  *
  * 运行：npm run web
  */
@@ -350,9 +350,9 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
 /** 直接运行时启动（tsx src/web/server.ts）。 */
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  if (!process.env.DEEPSEEK_API_KEY) {
-    console.error("未设置 DEEPSEEK_API_KEY，无法启动。");
-    console.error('PowerShell：$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"');
+  if (!process.env.LLM_API_KEY) {
+    console.error("未设置 LLM_API_KEY，无法启动。");
+    console.error('PowerShell：$env:LLM_API_KEY = "sk-xxxxxxxx"');
     process.exit(1);
   }
   const port = Number(process.env.WEB_PORT ?? DEFAULT_PORT);

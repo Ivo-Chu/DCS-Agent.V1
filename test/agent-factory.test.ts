@@ -2,7 +2,7 @@
  * dcs/agent-factory.ts 组装链路测试（2026-09-28 取消信号修复的回归）。
  *
  * 核心验证：不注入假 streamFn，走真实组装（createDcsAgent →
- * createDeepSeekStreamFn({signalProvider}) → fetch），仅拦截全局 fetch：
+ * createOpenAiStreamFn({signalProvider}) → fetch），仅拦截全局 fetch：
  * - 模型请求实际收到的 AbortSignal 必须就是 holder.controller.signal
  *   （同一对象，不是复制引用——复制正是旧 bug：超时 abort 打不到模型请求）；
  * - abort 后模型调用失败（错误编码为最终回复，Run 不崩溃）；
@@ -48,6 +48,7 @@ const waitFor = async (fn: () => boolean, ms = 2000): Promise<boolean> => {
 interface FetchRecord {
   signal: AbortSignal | undefined;
   abortedAtCall: boolean;
+  body: Record<string, any>;
 }
 
 const fetchCalls: FetchRecord[] = [];
@@ -61,6 +62,7 @@ globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
   const signal = init?.signal as AbortSignal | undefined;
   fetchCalls.push({
     signal,
+    body: JSON.parse(String(init?.body)),
     abortedAtCall: Boolean(signal?.aborted),
   });
   return new Promise<Response>((_resolve, reject) => {
@@ -74,10 +76,12 @@ globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch;
 
 async function main(): Promise<void> {
-  // createDeepSeekStreamFn 在工厂内读取环境变量；测试注入哑 key（不发真实请求）
-  process.env.DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? "sk-test-factory";
+  process.env.LLM_BASE_URL = "http://localhost:8000/v1";
+  process.env.LLM_MODEL = "Qwen3.5-35B";
+  // createOpenAiStreamFn 在工厂内读取环境变量；测试注入哑 key（不发真实请求）
+  process.env.LLM_API_KEY = process.env.LLM_API_KEY ?? "sk-test-factory";
 
-  section("F. agent-factory 取消信号组装链路（拦截 fetch，真实 DeepSeek StreamFn）");
+  section("F. agent-factory 取消信号组装链路（拦截 fetch，真实 LLM StreamFn）");
 
   const holder: DcsAgentHolder = { controller: new AbortController() };
   const session = createMockSession();
@@ -97,6 +101,11 @@ async function main(): Promise<void> {
     fetchCalls[0]?.signal === holder.controller.signal,
     `signal 一致性失败：${String(fetchCalls[0]?.signal)}`
   );
+
+  const body = fetchCalls[0]?.body;
+  check("F2a Qwen 模型、流式与关闭思考参数", body?.model === "Qwen3.5-35B" && body.stream === true && body.chat_template_kwargs?.enable_thinking === false);
+  check("F2b 原有三个工具与自动选择", body?.tool_choice === "auto" && body.tools?.length === 3 && ["investigate_dcs_code", "query_dcs_data", "search_dcs_knowledge"].every(name => body.tools.some((t: any) => t.function.name === name)));
+  check("F2c 不添加采样参数", body && !("temperature" in body) && !("top_p" in body));
 
   // ---- F3：超时 abort → 模型调用失败，错误编码为最终回复（Run 不崩溃）----
   holder.controller.abort();

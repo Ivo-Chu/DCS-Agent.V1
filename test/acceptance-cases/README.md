@@ -37,7 +37,7 @@
 ## 运行
 
 ```powershell
-# 需已设置：DEEPSEEK_API_KEY、DCS_DB_USER / DCS_DB_PASSWORD / DCS_DB_CONNECT_STRING
+# 需已设置：LLM_API_KEY、DCS_DB_USER / DCS_DB_PASSWORD / DCS_DB_CONNECT_STRING
 npm run test:accept:live
 ```
 
