@@ -374,7 +374,7 @@ function dbDictOwner(): string {
 function buildQueryDcsDataDescription(): string {
   const owner = dbDictOwner();
   return [
-    "在 DCS 系统数据库（Oracle）中执行只读 SELECT 查询，获取系统真实运行数据（权限、报餐、流程状态等）。你可以自主编写 SQL。",
+    "在 DCS 系统数据库（Oracle）中执行只读 SELECT 查询，获取系统真实运行数据。你可以自主编写 SQL。",
     "",
     `【schema 前缀】业务表属于 schema「${owner}」，查询必须带前缀（如 ${owner}.S2_Employee），裸表名会报 ORA-00942。不确定某表的 schema 时可反查：SELECT OWNER FROM ALL_TABLES WHERE TABLE_NAME = '表名'。`,
     "",

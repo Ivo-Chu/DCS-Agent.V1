@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { AgentEvent } from "../core/events.ts";
 import { createDcsAgent } from "../dcs/agent-factory.ts";
+import { maskPii } from "../dcs/hooks.ts";
 import { loadEnvLocal } from "../dcs/env-local.ts";
 
 loadEnvLocal();
@@ -188,6 +189,20 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     // 同一 holder，立即生效）；旧 Run 的 aborted signal 不影响新 Run
     entry.holder.controller = new AbortController();
 
+    // 仅服务端观测：复用既有 logger 和 Agent 事件，不改变 SSE 协议。
+    const runId = randomUUID();
+    const runStartedAt = Date.now();
+    const toolStarts = new Map<string, number>();
+    let toolStep = 0;
+    const trace = (event: string, details: Record<string, unknown> = {}): void => {
+      try {
+        log(JSON.stringify({ time: new Date().toISOString(), runId, event, ...details }));
+      } catch {
+        // 日志失败不能中断事件转发或 Run 清理。
+      }
+    };
+    trace("run_start", { employeeNo: identity.employeeNo });
+
     let finished = false;
     let timedOut = false;
     const finish = (): void => {
@@ -196,6 +211,7 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       clearTimeout(timer);
       unsubscribe();
       entry.busy = false;
+      trace("run_end", { elapsedMs: Date.now() - runStartedAt, toolCalls: toolStep });
       res.end();
     };
 
@@ -205,15 +221,34 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       if (e.type === "message_delta") {
         sseSend(res, { type: "delta", text: e.text });
       } else if (e.type === "tool_execution_start") {
+        toolStarts.set(e.toolCallId, Date.now());
+        trace("tool_start", {
+          step: ++toolStep,
+          toolCallId: e.toolCallId,
+          tool: e.toolName,
+          args: maskPii(JSON.stringify(e.args) ?? ""),
+        });
         sseSend(res, { type: "tool_step", status: "start", name: e.toolName });
       } else if (e.type === "tool_execution_end") {
+        const startedAt = toolStarts.get(e.toolCallId);
+        toolStarts.delete(e.toolCallId);
+        trace("tool_end", {
+          toolCallId: e.toolCallId,
+          tool: e.toolName,
+          elapsedMs: startedAt === undefined ? null : Date.now() - startedAt,
+          isError: e.isError,
+          summary: maskPii(e.summary),
+        });
         sseSend(res, { type: "tool_step", status: "end", name: e.toolName, isError: e.isError });
+      } else if (e.type === "agent_error") {
+        trace("agent_error", { message: maskPii(e.message) });
       }
     });
 
     const timer = setTimeout(() => {
       if (finished) return;
       timedOut = true;
+      trace("run_timeout");
       entry.holder.controller.abort(); // 中止当前及后续模型请求
       discardEntryIfCurrent(identity.employeeNo, entry); // 废弃可能被污染的 Agent（仅当仍是本实例）
       sseSend(res, { type: "timeout", message: "这次查询超时，请稍后重试。" });
@@ -223,6 +258,7 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     // 前端停止/关闭页面：连接断开即中止 Run（迟到结果无人接收，直接废弃）
     res.on("close", () => {
       if (!finished) {
+        trace("run_disconnected");
         entry.holder.controller.abort();
         discardEntryIfCurrent(identity.employeeNo, entry);
         finish();
@@ -234,6 +270,7 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       if (finished) return; // 已超时或客户端断开
       sseSend(res, { type: "final", text: answer.trim().length > 0 ? answer : "这次查询未能生成回复，请稍后重试。" });
     } catch (err) {
+      trace("run_error", { message: maskPii(String(err)) });
       log(`[web] Run 异常（${identity.employeeNo}）：${String(err)}`);
       if (!finished && !timedOut) {
         sseSend(res, { type: "error", message: "处理出现问题，请稍后重试。" });

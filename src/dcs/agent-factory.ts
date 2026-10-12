@@ -39,7 +39,7 @@ export interface CreateDcsAgentOptions {
   maxTurns?: number;
 }
 
-export const DEFAULT_MAX_TURNS = 24;
+export const DEFAULT_MAX_TURNS = 32;
 
 export function createDcsAgent(opts: CreateDcsAgentOptions): Agent<DcsToolContext> {
   const { session, holder, streamFn, maxTurns = DEFAULT_MAX_TURNS } = opts;
