@@ -221,6 +221,7 @@ export const searchDcsKnowledgeTool: ToolDefinition<SearchDcsKnowledgeArgs, DcsT
       return {
         output: `知识库中未找到与「${query.slice(0, 80)}」相关的资料（可换个说法再检索一次）。`,
         isError: false,
+        details: { chunkCount: 0, empty: true },
       };
     }
 
@@ -244,6 +245,9 @@ export const searchDcsKnowledgeTool: ToolDefinition<SearchDcsKnowledgeArgs, DcsT
     if (outcome.rerankFallbackNote) parts.push(`（${outcome.rerankFallbackNote}）`);
     parts.push(footer);
     const elapsed = Date.now() - startedAt;
-    return { output: parts.join("\n\n").concat(`\n\n（检索耗时 ${elapsed}ms）`) };
+    return {
+      output: parts.join("\n\n").concat(`\n\n（检索耗时 ${elapsed}ms）`),
+      details: { chunkCount: outcome.chunks.length, empty: false },
+    };
   },
 };

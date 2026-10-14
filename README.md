@@ -1,14 +1,14 @@
 # DCS Agent v1 — 功能与技术说明文档
 
 > 状态：**现行（项目唯一现状文档）**；docs/ 为决策历史、audit/ 为修复档案、docs/archive/ 为已废弃方案，冲突时以代码为准（详见 AGENTS.md）
-> DCS 员工智能助手：自研轻量 Agent Runtime + 企业微信机器人 / 网页端两个接入通道 + 真实 Oracle 数据查询、本地知识库（LanceDB + 集团 Embedding/Rerank）与 DCS 源码调查三个工具
+> DCS 员工智能助手：自研轻量 Agent Runtime + 企业微信机器人 / 网页端两个接入通道 + 真实 Oracle 数据查询、本地知识库（LanceDB + 集团 Embedding/Rerank）、受控元数据与 DCS 源码调查四个工具
 > 版本：v1.x · TypeScript / Node 22+ / ESM（运行时依赖：@wecom/aibot-node-sdk、oracledb）
 
 ---
 
 ## 1. 项目定位
 
-自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）与**源码调查**（`investigate_dcs_code`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
+自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）、**数据库结构**（`inspect_dcs_schema`）与**源码调查**（`investigate_dcs_code`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
 
 ```
 User Prompt → Agent → AgentLoop → LLM → ToolCall → Tool Execution
@@ -37,7 +37,12 @@ dcs-agent/
 │   │   ├── session.ts        # SessionUser / DcsSession / DcsToolContext + Mock 会话
 │   │   ├── prompt.ts         # systemPrompt 定稿文案 + 当前员工身份注入
 │   │   ├── hooks.ts          # afterToolCall：PII 脱敏（手机号 / 身份证）
-│   │   └── tools.ts          # 三个 DCS 工具 + mock 数据 + 只读源码检索
+│   │   └── tools.ts          # 四个 DCS 工具的稳定注册列表
+│   ├── observability/        # 日志系统（2026-10-12）：同一事件流 → 中文终端日志 + JSONL 结构化日志
+│   │   ├── observer.ts       # attachRunObserver：订阅 Agent 事件、统计与编排；幂等 end(reason) 保证超时/断开恰一次落盘
+│   │   ├── formatter.ts      # 中文终端格式化（NORMAL/DEBUG 两级，ANSI+符号双标识）
+│   │   ├── jsonl-writer.ts   # 每 Run 一个 logs/*.jsonl，缓冲落盘、写失败不影响主流程
+│   │   └── redact.ts         # 日志脱敏统一防线（仅凭据：字段名+嵌套结构识别；保留业务明细/路径/SQL 字面值）
 │   └── index.ts              # CLI REPL 入口（组装 core + dcs）
 └── test/
     ├── smoke.ts              # 42 项冒烟测试（FakeStreamFn，无需 API key）
@@ -121,6 +126,18 @@ agent.prompt("为什么我报不了餐？")
 
 Emitter 为同步实现，单个消费者异常不阻断事件流。不实现 `turn_start` / `turn_end` / `progress` / `update` 类事件。
 
+### 3.5 日志系统（observability，2026-10-12）
+
+**唯一数据流**：`Agent Runtime → AgentEvent → attachRunObserver →（脱敏）→ Console Formatter（中文终端日志）+ JSONL Writer（logs/*.jsonl）`。core 只产生通用执行事件、零展示逻辑；日志系统的任何故障不影响主流程（observer 异常全部吞掉，JSONL 写失败仅标记不再写）。
+
+- **core 侧新增 4 个结构化事件**（原 7 个事件字段语义不变）：`run_start` / `model_call_start` / `model_call_end` / `run_end`；`tool_execution_*` 增加 `runId / turn / step / durationMs / details`（工具自带统计：行数、命中数、错误码等）。Agent 为每次 `prompt()` 生成 runId。
+- **Token 统计**：模型请求带 `stream_options.include_usage`，Provider 返回的真实 usage 逐轮记录；**未提供记「未提供」/ JSONL 记 null，绝不估算冒充**。部分轮次缺失时总量标「未知」并保留已知小计与覆盖轮数（不把小计冒充完整总量）；缓存读取/写入分别累计、不与输入 Token 相加。真实 0 与未提供严格区分。消息数不等于 Token，本系统不做近似换算。（集团网关对 `include_usage` 的兼容性未实测，列为限制。）
+- **终端日志两级**（`DCS_LOG_LEVEL`，默认 normal）：normal 显示轮次/工具块（[01] 编号、SQL 结构、行数、耗时、状态符号 ✓/✗/⚠）与结束统计；debug 追加参数摘要、toolCallId、字段列表、停止原因、完整工具结果（含 hook 处理前后差异）与 Provider 原始 finish_reason。**DEBUG 不绕过凭据脱敏**。共享终端时终端行统一带 `[runId]` 前缀，多 Run 可区分归属；工具开始时立即输出 `▶ 工具调用 [NN] 名称` 简洁提示。
+- **JSONL**：每 Run 一文件 `logs/YYYY-MM-DD_HH-mm-ss_<runId>.jsonl`，一行一条独立 JSON（`run_start / model_call_start / model_call_end / tool_start / tool_end / run_end`），含 timestamp/runId/turn/step/耗时/统计。缓冲 ≥20 条后台落盘，run_end flush。多 Run 并发按 runId 隔离，互不串日志。
+- **脱敏统一防线（redact.ts，2026-10-13 边界澄清后收敛）**：开发者日志允许员工工号、姓名、业务查询明细与排障所需源码路径；仅脱敏访问凭据——按字段名+嵌套结构识别（password/token/apiKey/accessToken/secret 等，覆盖对象与数组），外加文本内常见凭据赋值形态（与 hooks.ts CREDENTIAL_RE 同规则）。Token 用量统计字段（inputTokens 等数字）明确排除不误脱敏。SQL 保留双引号字段名与业务字面值。脱敏只作用于日志副本，不改变工具参数/结果与模型上下文（对话输出保护仍由 dcs/hooks.ts maskPii 管线负责）。
+- **结束与落盘（2026-10-13 修复）**：observer 提供幂等 `end(reason)`——Web 超时/客户端断开、企微超时（AgentRunner.onRunEnd 回调）记录准确结束原因并 flush；正常 run_end 与通道清理重复到达只终结一次，迟到事件不重开已结束日志。测试可 await flush，不依赖固定睡眠。
+- **三通道统一接入**：CLI / Web / 企微在每次 Run 前 `attachRunObserver`（channel 标识区分），结束自动注销。Web/企微的回复机制与 SSE 协议不变，日志只写到服务端终端。run_start 的模型/Provider 标识由 factory 统一从 Provider 配置获取（不含服务地址），通道不再各自读环境变量猜测。默认日志位置固定为项目根 `logs/`。
+
 ---
 
 ## 4. 模型接入（core/model/openai-compatible.ts）
@@ -157,7 +174,7 @@ DcsToolContext（可信，运行时注入）
       工具真正查询的员工
 ```
 
-- 三个工具的参数 Schema 中**不存在任何身份字段**——模型构造不出 `{"employeeNo": "10087"}` 这种越权查询
+- 四个工具的参数 Schema 中**不存在任何身份字段**——模型构造不出 `{"employeeNo": "10087"}` 这种越权查询
 - 模型只能指定业务参数（如 `menuName`、`dataType`、`keyword`）
 - `v1` 身份来源：`dcs/session.ts` 直接构造 Mock 会话（张三 / 10086 / 制造一部 / 普通员工）
 
@@ -193,33 +210,24 @@ DcsToolContext（可信，运行时注入）
 
 ---
 
-## 6. 工具清单（当前 3 个，全部真实数据源）
+## 6. 工具清单（当前 4 个；2026-10-14 Tool V2）
 
-| 工具 | 状态 | 参数 | 数据来源 | 说明 |
-|---|---|---|---|---|
-| `search_dcs_knowledge` | **在用**（2026-09-29 RAG 接入；同日由 RAGFlow 替换为本地实现） | `query`（必填） | **本地知识库**：本地解析分块 → 集团 Embedding（Qwen3-Embedding-8B）→ LanceDB 余弦召回（默认 20 候选）→ 集团 Rerank（Qwen3-Reranker-8B，默认前 5） | 操作手册/制度/FAQ 等文档问答；返回原文片段+文档标题+章节/PDF页码出处；总输出约 8000 字（超出时减少低排名片段）；Rerank 失败降级向量序并注明；Embedding 失败 isError:true（不伪装无资料）；未找到（isError:false）与服务失败严格区分；超时与 Run 取消中止 HTTP；未配置 DCS_EMBEDDING_* 时能力不可用且 systemPrompt 不注入 |
-| `query_dcs_data` | **在用**（方案 docs/query-dcs-data-plan-v1.md） | `sql`（必填） | **真实 Oracle 库**（oracledb Thin 连接池，只读） | 模型自主写 SELECT；护栏：纯函数 guardSql（仅 SELECT/WITH、单语句、拒 FOR UPDATE）+ 100 行截断 + 单元格 200 字符 + 60KB 体积保险；ORA 错误透传供模型自修正；结果统一过 maskPii 脱敏 |
-| `investigate_dcs_code` | **在用**（方案 v2，取代原 search_dcs_code） | `query`（必填）、`path`（可选）、`contextLines`（可选，默认 3 最大 50） | **真实实现**：DCS 源码只读搜索 + 上下文读取 | 命中 ≤15 处，每处返回相对路径 + 行号 + 命中行（> 标记）+ 前后上下文；模型可多次调用逐步深入 |
+| 工具 | 实际参数 | 执行范围 |
+|---|---|---|
+| `search_dcs_knowledge` | `query` | 原有 Embedding → LanceDB → Rerank，未调整检索实现 |
+| `investigate_dcs_code` | `operation=find/search/read`，`pattern/path/mode/offset/limit` | 白名单源码；find 最多50，search最多20，read默认80/最多200行 |
+| `inspect_dcs_schema` | `operation=list/describe`，`keyword/tables/limit` | 可信企微身份或显式开启的 Web 测试身份；仅本人菜单查询所需4张表的结构；list默认20/最多50，describe最多5表 |
+| `query_dcs_data` | `query=self_permissions`；旧 `sql` 调用明确拒绝 | 可信企微当前员工（或服务端显式开启 Web 测试身份）的角色/菜单分配，工号绑定；其他业务授权尚未确认 |
 
-**Legacy Mock 工具（check_dcs_permission / query_business_data）已于 2026-09-24 移除**（真实库验证 live:db 4/4 通过后，用户授权删除；所有业务数据查询统一走 query_dcs_data 真实库）。
-
-`query_dcs_data` 实现要点（docs/query-dcs-data-plan-v1.md）：
-
-- **数据链路**：`src/dcs/db/` 三模块——guard.ts（纯函数护栏）/ format.ts（行数与体积截断）/ client.ts（DbClient 接口 + oracledb Thin 连接池 min 1 / max 2，callTimeout 20s）；
-- **环境变量门控**：`DCS_DB_USER / DCS_DB_PASSWORD / DCS_DB_CONNECT_STRING` 任一缺失 → 能力明确返回不可用（与 DCS_SOURCE_ROOT 模式一致），不硬编码连接信息；
-- **安全边界**：仅 SELECT/WITH；单语句（注释外分号即拒绝）；拒 FOR UPDATE；不执行任何 DML/DDL——测试期账号本身只读；
-- **边界 4 对 DB 继续生效**：session 身份决定可查范围，数据库中其他员工的个人数据同样不得代查；
-- **数据字典提示（2026-09-24 方案A+B）**：工具描述内置常用表速查（S2_Employee + 主权限表 S2_UserRole / S2_Role / S2_RolePermission / S2_Permission，字段名来自源码实体验证）+ "查某工号权限" JOIN 示例 + 防截断聚合提示；DCS 另有一组 ADM 前缀权限表（S2_ADMUserRole 等）为管理模块独立权限、普通员工通常无记录，已在字典中注明；schema 提示为 getter 动态生成——`DCS_DB_SCHEMA` 显式配置 > identity 链路自动发现结果 > 登录名兜底，修复了"未设 DCS_DB_SCHEMA 时回退登录用户名把模型引向 0 行数据字典"的死路提示（真人测试"我有什么权限"曾因此消耗 52 次工具调用试错）；
-- **工具级观测日志（2026-09-24 方案C）**：bot.ts 订阅 tool_execution 事件，每次调用打印 `[tool] → 工具名 参数摘要` / `[tool] ← 工具名（耗时，结果摘要）`——测试期区分"没查对表"与"真没有数据"的观测手段（仅本地控制台，不进企微回复）；
-- **测试**：smoke 场景 L（12 项，假 DbClient 注入，无需真库）+ `npm run test:live:db`（真实库 L-DB1~4，需环境变量，未配置优雅 SKIPPED）。
-
-`investigate_dcs_code` 实现要点（docs/tool-convergence-plan-v2.md）：
-
-- **搜索 + 定位 + 上下文融合**：单次调用即返回命中位置与必要上下文，无需 search→read 两段式；
-- **范围**：顶层项目白名单 `Luxshare.DCS.WebApi / Luxshare.DCS.WebApp / Common` + 目录黑名单（bin/obj/packages/Scripts/Upload/Images/Content 等）+ 扩展名白名单（.cs/.cshtml/.js/.ts/.config/.json/.xml，排除 .min.）；
-- **安全边界**：path 必须 resolve 后位于 `DCS_SOURCE_ROOT` 内（防 ../ 穿越 / 绝对路径 / 盘符 UNC 逃逸）；凭据文件名黑名单（.env/.pfx/.key/.pem/secret*）；单文件 2MB；单次命中 15 处、单文件 3 处；输出总体积 60KB 保险；
-- **性能**：进程内文件列表 + 内容缓存（总量 256MB 上限），长驻 bot 首次全量约 10s、同进程后续约 1s；
-- **凭据防线**：ToolResult 统一过 afterToolCall 脱敏（Password/Pwd/Secret/Token/ApiKey/AccessKey 值 → `***`），Web.config 可调查但连接串密码不会进入模型上下文。
+- 工具注册顺序与上表一致。Core、Provider、maxTurns、Context 和执行顺序本次未改动。
+- 源码使用外部 **ripgrep**（本机已检测）；无需新增 npm 依赖。Windows/Linux 需在 PATH 安装 `rg`，或通过 `DCS_RG_PATH` 配置可执行文件绝对路径；缺失会明确报错，无隐式降级。使用 `execFile` 参数数组，不执行模型 Shell。
+- `find` 支持 `*`/`?` 文件名或路径通配符；`search` 默认 literal 连续字面量，不拆分空格关键词；regex 使用 ripgrep 正则，`宿舍|入住` 表示或。find/search 的 offset 从0计；read 从1计。所有返回路径可用于 read。
+- 保留 `Luxshare.DCS.WebApi / Luxshare.DCS.WebApp / Common` 项目白名单及目录/扩展名过滤。严格拒绝路径穿越和符号链接；配置文件只可发现文件名，不读取内容；源码敏感行及后续赋值行隐藏。每次读取最多2MiB、扫描预算10秒、候选最多15000、结果最多24000字符；截断/扫描不完整显式标记。不缓存文件内容，避免旧代码结果。
+- Schema 使用 Oracle ALL_* 系统视图、绑定参数和明确 OWNER。沿用 `DCS_DB_SCHEMA` 或身份链路发现结果；未发现时仅查询 S2_EMPLOYEE 的唯一 OWNER，多 Schema 拒绝。允许结构仅 `S2_USERROLE/S2_ROLE/S2_ROLEPERMISSION/S2_PERMISSION`，不对员工开放整个库；未授权表拒绝，无业务样例。主键/外键来自真实约束，复合键按 POSITION 对齐；其他业务关系标记 unknown。
+- 数据查询只执行程序生成的固定参数化 SELECT。默认不接受 Web 工号建档；仅受控测试可在 .env.local 设置 DCS_ALLOW_WEB_TEST_IDENTITY=true 并重启 Web，按输入工号查询本人角色/菜单及相关4张表结构（输入任意有效工号即视为该员工，生产必须关闭）。CLI mock、角色名称、自称管理员均不能授权；自由 SQL 一律 forbidden。`guardSql` 只是保守文本预检查，不是安全解析器，也不是生产授权边界。
+- Oracle 连接池复用现有实现；增加 binds、只读事务及 finally 回滚，保留20秒单次调用超时，驱动多取一行判断1000行截断，展示最多100行/约60KiB。结构化输出区分 success/empty/sql_error/forbidden/timeout/unavailable/invalid_args，保留错误码而不回传原始连接异常。
+- **部署阻塞**：尚未验证真实数据库最小只读账号、真实约束/表字段和企微部署身份映射；宿舍的厂区授权与统计口径未完成业务验收。因此“所有员工宿舍入住数”不执行数据查询，也不以拒绝冒充效率提升。Web/CLI 的数据库功能需接入正式身份后才可开放。
+- 详见 [Tool V2 交付与验证记录](docs/tool-v2-delivery.md)，含实际 JSON Schema、兼容性变化、文件清单与人工确认项。历史 §9 的旧工具行为不再代表当前接口。
 
 ### 6.1 本地知识库（search_dcs_knowledge 的后端）
 
@@ -254,7 +262,7 @@ DcsToolContext（可信，运行时注入）
 
 **当前已验证状态**：离线全链路 46 项测试通过（真实 LanceDB 临时库 + mock 集团接口：含中文同义检索「取消报餐」→「撤销订餐」、增量同步四态、单文件失败保留、Rerank 降级、请求取消、超时）。**集团真实接口与真实文档导入未验证**（缺接口地址与凭据），见 §9.9。测试文档模板：`test/acceptance-cases/knowledge-testdoc.md`（虚构系统手册 + 5 个验证问题）。
 
-**目标架构已落地**：`search_dcs_knowledge`（知识库）+ `query_dcs_data`（数据库）+ `investigate_dcs_code`（源码调查），无 Mock 工具。
+**当前工具**：知识库 + 源码 + 受控 Schema + 授权数据查询，共四个；生产注册中无 Mock 工具。
 
 
 
@@ -273,7 +281,8 @@ npm install                  # 安装依赖（typescript / tsx / @types/* / @wec
 npm run check                # 统一离线检查（typecheck + 全部离线测试，任一失败非零退出；不含真实模型/数据库测试）
 npm run typecheck            # tsc --noEmit
 npm test                     # 冒烟测试（FakeStreamFn + 假 DbClient，无需 key/真库）
-npm run test:accept          # 三验收场景离线接线验证（FakeStreamFn，不证明模型行为）
+npm run test:accept          # 旧 Runtime 剧本 + 生产 Tool V2 离线验收
+npm run test:tools           # 生产工具边界、Fake Oracle/Model、临时源码回归
 npm run test:cli             # CLI 展示层入口级验证（本地假模型）
 npm run test:wecom           # 企微 Channel 层测试（假动作/假 Agent/可控时钟）
 npm run test:web             # Web Channel 层测试（假身份+假 Agent，真实 HTTP）
@@ -281,6 +290,7 @@ npm run test:identity        # 身份链路逻辑测试（临时 fixture，无�
 npm run test:factory         # Agent 组装工厂测试（拦截 fetch 验证取消信号真实接线）
 npm run test:accept:harness  # 真实业务验收 harness 离线测试（案例加载/会话隔离/结果分类）
 npm run test:knowledge      # 知识库全链路测试（真实 LanceDB 临时库 + mock 集团接口，无需配置）
+npm run test:observability  # 日志系统测试（事件序列/统计/凭据脱敏/Usage 完整性/三层结果/并发隔离/写失败容错，61 项）
 npm run knowledge:ingest    # 知识库资料导入/更新（需 DCS_EMBEDDING_*，见 §6.1）
 npm run test:live            # LLM 真实 key 适配器单测（需 LLM_API_KEY）
 npm run test:live:db         # 真实 Oracle 库验证（需 DCS_DB_* 三变量，未配置优雅 SKIPPED）
@@ -309,11 +319,13 @@ npm run web                  # 网页端（需 LLM_API_KEY + DCS_DB_*）
 | `DCS_RERANK_API_KEY` / `DCS_RERANK_MODEL` | 否 | Rerank 凭据（缺省复用 Embedding 凭据）/ 模型（默认 `Qwen3-Reranker-8B`） |
 | `KNOWLEDGE_DIR` / `KNOWLEDGE_INDEX_DIR` | 否 | 资料目录（默认 `./knowledge/documents`，gitignored）/ 索引目录（默认 `./data/knowledge`，gitignored） |
 | `DCS_KB_TIMEOUT_MS` / `DCS_KB_CANDIDATES` / `DCS_KB_TOP_N` / `DCS_KB_EMBED_BATCH` | 否 | 接口超时（20000，覆盖正文读取）/ 召回候选（20）/ rerank 返回数（5）/ 向量化批量（16） |
-| `DCS_DB_USER` | query_dcs_data（真实库） | DCS 库用户名（测试期建议只读账号）。与下两项任一缺失 → 数据库查询能力明确返回不可用 |
+| `DCS_DB_USER` | query_dcs_data（真实库） | DCS 库用户名（部署必须使用最小只读权限账号，本次未验证实际授权）。与下两项任一缺失 → 数据库查询能力明确返回不可用 |
 | `DCS_DB_PASSWORD` | query_dcs_data（真实库） | DCS 库密码 |
 | `DCS_DB_CONNECT_STRING` | query_dcs_data（真实库） | 连接串（`主机:端口/服务名` 或 EZConnect 格式），oracledb Thin 模式免装 Oracle 客户端 |
 | `DCS_DB_SCHEMA` | 否 | DCS 表所属 schema。**通常无需设置**：未设置时身份链路会自动查 ALL_TABLES 发现 S2_Employee 的 OWNER（唯一时自动采用，多个时要求显式指定，无法访问时报权限错误）。设置后跳过自动发现 |
-| `WEB_PORT` / `WEB_RUN_BUDGET_MS` / `WEB_STATIC_DIR` | 否 | Web 通道端口（8787）/ 单 Run 预算（90000）/ 前端静态目录（默认 ../DCS Agent.web） |
+| `DCS_LOG_LEVEL` | 否 | 终端日志级别：`normal`（默认）/ `debug`（追加参数摘要、toolCallId、字段列表、停止原因、完整工具结果与原始 finish_reason；不绕过凭据脱敏） |
+| `DCS_LOG_COLOR` / `NO_COLOR` | 否 | 终端颜色开关：`DCS_LOG_COLOR=0` 或设置 `NO_COLOR` 关闭 ANSI 颜色（状态符号 ✓/✗/⚠ 仍保留） |
+| `WEB_PORT` / `WEB_RUN_BUDGET_MS` / `WEB_STATIC_DIR` | 否 | Web 通道端口（8787）/ 单 Run 预算（180000）/ 前端静态目录（默认 ../DCS Agent.web） |
 
 ### 7.2.1 三层验证口径（重要区分）
 
@@ -367,7 +379,7 @@ npm run wecom:bot
 → 工号建档（dcs/identity.ts resolveEmployeeByCode：S2_Employee 按 Code 查库，仅在职）
 → 每员工一个 Agent（busy 拒绝并发，无确认环节）
 → SSE 流式回复（文本增量 + 工具步骤事件；不转发工具参数/结果摘要）
-→ 90s 预算 abort + 丢弃 Agent（与 agent-runner 同口径）
+→ 180s 预算 abort + 丢弃 Agent
 ```
 
 | 位置 | 职责 |
@@ -386,9 +398,11 @@ $env:LLM_API_KEY = "sk-xxxx"; $env:DCS_DB_USER="xxx"; $env:DCS_DB_PASSWORD="xxx"
 npm run web   # http://localhost:8787
 ```
 
-可选环境变量：`WEB_PORT`（默认 8787）、`WEB_RUN_BUDGET_MS`（默认 90000）、`WEB_STATIC_DIR`。
+可选环境变量：`WEB_PORT`（默认 8787）、`WEB_RUN_BUDGET_MS`（默认 180000）、`WEB_STATIC_DIR`。
 
-### 7.3 测试覆盖（当前状态）
+### 7.3 测试覆盖
+
+2026-10-14 Tool V2 当前验证见 [交付记录](docs/tool-v2-delivery.md)。下面带旧日期/数量的记录是历史快照；新工具替换了旧源码接口测试，旧自由 SQL 剧本改用测试专用 fixture，生产授权独立验证。
 
 | 测试 | 结果 |
 |---|---|
@@ -415,7 +429,9 @@ npm run web   # http://localhost:8787
 
 冒烟测试验证点：prompts / context / newMessages 边界与调用方数组不可变性、多 Turn 循环、ToolCall→execute→ToolResult→下一轮 LLM 回填、Agent 状态写回、脱敏管线（含"脱敏发生在回填模型之前"）、beforeToolCall 阻断扩展点、maxTurns 保护（含耗尽时终止说明）、StreamFn 永不 reject 契约，以及审查回归：SSE 坏帧 / 无 finish_reason EOF 编码为 error（H1–H5）、length 截断残缺 toolCalls 剥离与序列化配对（I1–I6）、Hook 异常兜底不泄原文 / 不击穿 Run（J1–J7）。
 
-### 7.4 验收场景接线输出（FakeStreamFn 预置模型行为 + 假 DbClient——仅证明 Runtime 接线与状态传递，不证明真实模型行为）
+### 7.4 历史 Runtime 剧本输出（FakeStreamFn + 测试专用工具 + 假 DbClient）
+
+以下旧菜单/报餐剧本只验证通用 Runtime 接线；不是当前生产工具的数据授权验收。生产工具链见 `test/tools-v2.test.ts`。
 
 ```
 场景 1  "为什么我没有权限管理菜单"

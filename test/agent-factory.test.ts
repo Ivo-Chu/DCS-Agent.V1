@@ -87,7 +87,7 @@ async function main(): Promise<void> {
   const session = createMockSession();
   const agent = createDcsAgent({ session, holder });
 
-  check("F0 默认 maxTurns 为 24（与 bot/web/CLI 同口径）", DEFAULT_MAX_TURNS === 24);
+  check("F0 默认 maxTurns 为 32（与 bot/web/CLI 同口径）", DEFAULT_MAX_TURNS === 32);
 
   // ---- F1/F2：第一轮 —— 模型请求收到的就是 holder 内的 signal ----
   const run1 = agent.prompt("第一问");
@@ -104,7 +104,7 @@ async function main(): Promise<void> {
 
   const body = fetchCalls[0]?.body;
   check("F2a Qwen 模型、流式与关闭思考参数", body?.model === "Qwen3.5-35B" && body.stream === true && body.chat_template_kwargs?.enable_thinking === false);
-  check("F2b 原有三个工具与自动选择", body?.tool_choice === "auto" && body.tools?.length === 3 && ["investigate_dcs_code", "query_dcs_data", "search_dcs_knowledge"].every(name => body.tools.some((t: any) => t.function.name === name)));
+  check("F2b 四个工具与自动选择", body?.tool_choice === "auto" && body.tools?.length === 4 && ["investigate_dcs_code", "inspect_dcs_schema", "query_dcs_data", "search_dcs_knowledge"].every(name => body.tools.some((t: any) => t.function.name === name)));
   check("F2c 不添加采样参数", body && !("temperature" in body) && !("top_p" in body));
 
   // ---- F3：超时 abort → 模型调用失败，错误编码为最终回复（Run 不崩溃）----

@@ -1,7 +1,8 @@
 /**
  * dcs/db/guard.ts — SQL 稳定性护栏（纯函数，方案 query-dcs-data-plan-v1 §5）。
  *
- * 测试期最小集：仅防卡死与误写，不做权限收紧（账号本身只读，双保险）。
+ * 文本预检查，不是 SQL 解析器或授权边界。生产 query_dcs_data 不执行自由 SQL；
+ * 由 authorization.ts 的可信身份及固定参数化查询决定可执行内容。
  * - 仅允许 SELECT / WITH 开头；
  * - 单语句（含注释中藏分号的检测）；
  * - 拒绝 FOR UPDATE 锁定。
@@ -35,6 +36,9 @@ export function guardSql(sql: string): SqlGuardResult {
   }
   if (/\bfor\s+update\b/i.test(body)) {
     return { ok: false, reason: "不允许锁定语句（FOR UPDATE）。" };
+  }
+  if (/\b(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke|execute|begin|declare|function|procedure)\b/i.test(body)) {
+    return { ok: false, reason: "不接受写入、过程或内嵌 PL/SQL；此预检查不代表查询已获授权。" };
   }
   return { ok: true };
 }

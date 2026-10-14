@@ -13,6 +13,34 @@ export interface ToolOutput {
   output: string;
   /** 是否为错误结果。 */
   isError?: boolean;
+  /**
+   * 可选结构化观测细节（仅用于日志/诊断，不进入模型上下文）。
+   * 数值必须来自工具真实执行结果；字段全部可选，不知道就不填。
+   * 不得包含敏感明文（员工记录、凭据、完整源码等）。
+   */
+  details?: ToolExecutionDetails;
+}
+
+/** 工具执行的结构化观测细节（可选，工具自行上报，全部字段可缺省）。 */
+export interface ToolExecutionDetails {
+  /** 数据库工具：返回行数（0 行是正常结果，不是失败）。 */
+  rowCount?: number;
+  /** 数据库工具：返回字段名。 */
+  columns?: string[];
+  /** 数据库工具：结果是否被截断。 */
+  truncated?: boolean;
+  /** 数据库工具：SQL 错误码（如 ORA-00904）。 */
+  errorCode?: string;
+  /** 源码调查工具：扫描文件数。 */
+  scannedFiles?: number;
+  /** 源码调查工具：命中数量。 */
+  hitCount?: number;
+  /** 源码调查工具：是否达到单次命中上限。 */
+  hitLimitReached?: boolean;
+  /** 知识库工具：返回片段数量。 */
+  chunkCount?: number;
+  /** 空结果标记（查询成功但 0 行 / 无命中）。 */
+  empty?: boolean;
 }
 
 /** 模型发起的一次工具调用。 */
@@ -97,15 +125,38 @@ export type ModelStreamEvent =
       stopReason: AssistantMessage["stopReason"];
       /** stopReason 为 "error" 时的错误说明。 */
       errorMessage?: string;
+      /** Provider 返回的真实 Token 用量（未提供时缺省，不得估算冒充）。 */
+      usage?: TokenUsage;
+      /**
+       * Provider 原始 finish_reason（可选观测元数据）。
+       * 与归一化的 stopReason 分开保留——调试需要区分
+       * content_filter / stop 等原始原因；不影响停止策略。
+       */
+      finishReason?: string;
     };
+
+/**
+ * 模型 Token 用量（来自 Provider 真实返回，未提供的字段为 undefined/不填）。
+ * 语义约定：cacheReadTokens / cacheWriteTokens 是否已包含在 inputTokens 内
+ * 由 Provider 定义；统计层不得再相加造成重复计数。
+ */
+export interface TokenUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
 
 /**
  * 模型调用抽象。
  * v1 契约：永不抛异常、永不 reject；
  * API / 网络 / SSE 等失败统一编码为 stopReason:"error"。
  */
-export type StreamFn = (req: {
+export type StreamFn = ((req: {
   systemPrompt: string;
   messages: AgentMessage[];
   tools: ToolSchema[];
-}) => AsyncGenerator<ModelStreamEvent>;
+}) => AsyncGenerator<ModelStreamEvent>) & {
+  /** Provider 创建时确定的观测信息；自定义实现未提供时保持未知。 */
+  readonly observability?: Readonly<{ model: string; provider: string }>;
+};

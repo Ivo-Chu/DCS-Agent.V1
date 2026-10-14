@@ -6,6 +6,9 @@ identity.json
 .vs/
 .workbuddy/
 
+# Agent 运行日志（结构化 JSONL，本地复盘用，不入库）
+logs/
+
 # 真实业务验收案例（含真实工号）与运行报告
 test/acceptance-cases/cases.json
 test/acceptance-cases/reports/

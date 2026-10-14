@@ -13,7 +13,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveIdentity, resolveIdentityAsync, resetIdentityCache, getDiscoveredSchema } from "../src/dcs/identity.ts";
-import { queryDcsDataTool } from "../src/dcs/tools.ts";
 import { setDbClientFactoryForTest, type DbClient } from "../src/dcs/db/client.ts";
 
 let passed = 0;
@@ -208,17 +207,10 @@ const fakeDb: DbClient = {
     lastSql
   );
 
-  // 方案A+B：query_dcs_data 描述（getter）复用自动发现的 schema，且含常用表数据字典
-  // ——修复"未设 DCS_DB_SCHEMA 时回退登录用户名"把模型引向 0 行数据字典的死路
-  // 2026-09-24 真机修正：主权限表为 S2_UserRole 组（无 ADM 前缀），ADM 组为管理模块独立权限
-  check(
-    "I21 query_dcs_data 描述复用自动发现 schema 且含主权限表数据字典（AUTOOWNER.S2_Employee + S2_UserRole + S2_RolePermission）",
-    getDiscoveredSchema() === "AUTOOWNER" &&
-      queryDcsDataTool.description.includes("AUTOOWNER.S2_Employee") &&
-      queryDcsDataTool.description.includes("S2_UserRole") &&
-      queryDcsDataTool.description.includes("S2_RolePermission"),
-    queryDcsDataTool.description.slice(0, 200)
-  );
+  // 新工具执行层复用身份链路发现结果；不再向模型注入自由 SQL 字典。
+  const { resolveSchema } = await import("../src/dcs/db/authorization.ts");
+  check("I21 执行层复用已发现 Schema，无需再次查询元数据",
+    await resolveSchema({ async execute() { throw new Error("不应重新发现"); }, async close() {} }) === "AUTOOWNER");
 
   // 多 schema 歧义 → null（要求 DCS_DB_SCHEMA 显式指定）
   setDbClientFactoryForTest(() => ({

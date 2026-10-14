@@ -15,11 +15,11 @@
  *   POST /api/reset     新会话（丢弃该员工 Agent 实例；处理中返回 409 拒绝）
  *
  * 与 wecom 的差异：一次发送即完整问题（无确认状态机）；每员工同时只跑一个 Run
- * （busy 时拒绝新 Run）；90s 预算超时 abort + 丢弃 Agent（与 agent-runner 同口径）。
+ * （busy 时拒绝新 Run）；180s 预算超时 abort + 丢弃 Agent。
  *
  * 测试期身份：页面输入工号 → S2_Employee 查库（仅在职）；上线前换真实认证。
  *
- * 环境变量：WEB_PORT（默认 8787）、WEB_RUN_BUDGET_MS（默认 90000）、
+ * 环境变量：WEB_PORT（默认 8787）、WEB_RUN_BUDGET_MS（默认 180000）、
  *           WEB_STATIC_DIR（前端静态目录，默认 ../DCS Agent.web）、
  *           LLM_API_KEY（必需）、DCS_DB_*（身份与数据查询）。
  *
@@ -34,6 +34,7 @@ import type { AgentEvent } from "../core/events.ts";
 import { createDcsAgent } from "../dcs/agent-factory.ts";
 import { maskPii } from "../dcs/hooks.ts";
 import { loadEnvLocal } from "../dcs/env-local.ts";
+import { attachRunObserver } from "../observability/observer.ts";
 
 loadEnvLocal();
 import { resolveEmployeeByCode, type DcsIdentity } from "../dcs/identity.ts";
@@ -41,7 +42,7 @@ import { createSession } from "../dcs/session.ts";
 import { closeDbClient } from "../dcs/db/client.ts";
 
 const DEFAULT_PORT = 8787;
-const DEFAULT_BUDGET_MS = 90_000;
+const DEFAULT_BUDGET_MS = 1000_000;
 const MAX_QUESTION_CHARS = 2000;
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -56,11 +57,15 @@ export interface WebServerDeps {
   resolveIdentity?: (code: string) => Promise<DcsIdentity | null>;
   /** Agent 工厂（默认真实组装；测试注入假 Agent）。holder 每次 Run 替换 controller。 */
   createAgent?: (identity: DcsIdentity, holder: { controller: AbortController }) => AgentLike;
-  /** 单次 Run 预算（默认 90s，同企微口径）。 */
+  /** 单次 Run 预算（默认 180s）。 */
   budgetMs?: number;
   /** 静态文件目录（默认 WEB_STATIC_DIR 或 ../DCS Agent.web）。 */
   staticDir?: string;
   logger?: (msg: string) => void;
+  /** 等待 Run 日志落盘完成（测试用：可 await flush，不依赖固定睡眠）。 */
+  awaitLogs?: () => Promise<void>;
+  /** JSONL 日志目录（默认项目根 logs/；测试注入临时目录）。 */
+  logsDir?: string;
 }
 
 interface SessionRecord {
@@ -189,19 +194,20 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
     // 同一 holder，立即生效）；旧 Run 的 aborted signal 不影响新 Run
     entry.holder.controller = new AbortController();
 
-    // 仅服务端观测：复用既有 logger 和 Agent 事件，不改变 SSE 协议。
-    const runId = randomUUID();
-    const runStartedAt = Date.now();
-    const toolStarts = new Map<string, number>();
-    let toolStep = 0;
+    // 日志观测：中文终端日志 + logs/*.jsonl（与 CLI 同一事件流，不改变 SSE 协议）
+    // 模型/提供方标识由 run_start 事件携带（factory 统一从 Provider 配置获取）
+    const observer = attachRunObserver(entry.agent, {
+      channel: "Web",
+      write: (t) => log(t),
+      logsDir: deps.logsDir,
+    });
     const trace = (event: string, details: Record<string, unknown> = {}): void => {
       try {
-        log(JSON.stringify({ time: new Date().toISOString(), runId, event, ...details }));
+        log(JSON.stringify({ time: new Date().toISOString(), event, ...details }));
       } catch {
         // 日志失败不能中断事件转发或 Run 清理。
       }
     };
-    trace("run_start", { employeeNo: identity.employeeNo });
 
     let finished = false;
     let timedOut = false;
@@ -211,7 +217,6 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       clearTimeout(timer);
       unsubscribe();
       entry.busy = false;
-      trace("run_end", { elapsedMs: Date.now() - runStartedAt, toolCalls: toolStep });
       res.end();
     };
 
@@ -221,24 +226,8 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       if (e.type === "message_delta") {
         sseSend(res, { type: "delta", text: e.text });
       } else if (e.type === "tool_execution_start") {
-        toolStarts.set(e.toolCallId, Date.now());
-        trace("tool_start", {
-          step: ++toolStep,
-          toolCallId: e.toolCallId,
-          tool: e.toolName,
-          args: maskPii(JSON.stringify(e.args) ?? ""),
-        });
         sseSend(res, { type: "tool_step", status: "start", name: e.toolName });
       } else if (e.type === "tool_execution_end") {
-        const startedAt = toolStarts.get(e.toolCallId);
-        toolStarts.delete(e.toolCallId);
-        trace("tool_end", {
-          toolCallId: e.toolCallId,
-          tool: e.toolName,
-          elapsedMs: startedAt === undefined ? null : Date.now() - startedAt,
-          isError: e.isError,
-          summary: maskPii(e.summary),
-        });
         sseSend(res, { type: "tool_step", status: "end", name: e.toolName, isError: e.isError });
       } else if (e.type === "agent_error") {
         trace("agent_error", { message: maskPii(e.message) });
@@ -250,6 +239,9 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       timedOut = true;
       trace("run_timeout");
       entry.holder.controller.abort(); // 中止当前及后续模型请求
+      // F3：先幂等结束日志（记录准确原因并 flush），再释放回复；
+      // observer.end 是幂等的，迟到的 run_end 不会重复记录
+      void observer.end("timeout").then(() => deps.awaitLogs?.()).catch(() => undefined);
       discardEntryIfCurrent(identity.employeeNo, entry); // 废弃可能被污染的 Agent（仅当仍是本实例）
       sseSend(res, { type: "timeout", message: "这次查询超时，请稍后重试。" });
       finish();
@@ -260,6 +252,8 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
       if (!finished) {
         trace("run_disconnected");
         entry.holder.controller.abort();
+        // F3：断开路径同样幂等结束日志
+        void observer.end("disconnected").then(() => deps.awaitLogs?.()).catch(() => undefined);
         discardEntryIfCurrent(identity.employeeNo, entry);
         finish();
       }
@@ -276,6 +270,8 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
         sseSend(res, { type: "error", message: "处理出现问题，请稍后重试。" });
       }
     } finally {
+      // 正常完成：run_end 已终结 observer；detach 仅退订防御迟到事件
+      observer.detach();
       finish();
     }
   }

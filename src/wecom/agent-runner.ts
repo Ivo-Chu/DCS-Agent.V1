@@ -65,7 +65,7 @@ export class AgentRunner {
    * 执行一次完整 Run。Promise 结束 = 本轮处理完成（成功/失败/超时）。
    * runId 用于阻止迟到结果进入有效回复链。
    */
-  run(userId: string, question: string, token: unknown): Promise<void> {
+  run(userId: string, question: string, token: unknown, onRunEnd?: (reason: "completed" | "timeout" | "error") => void): Promise<void> {
     const runId = randomUUID();
     const budgetMs = this.deps.budgetMs ?? 90_000;
     const schedule = this.deps.schedule ?? ((fn: () => void, ms: number) => {
@@ -77,10 +77,11 @@ export class AgentRunner {
       let finished = false;
       let cancelTimer: (() => void) | null = null;
 
-      const finish = (): void => {
+      const finish = (reason: "completed" | "timeout" | "error"): void => {
         if (finished) return;
         finished = true;
         cancelTimer?.();
+        try { onRunEnd?.(reason); } catch { /* 观测失败不影响业务收尾 */ }
         resolve();
       };
 
@@ -102,7 +103,7 @@ export class AgentRunner {
           // 超时：Abort 模型请求（含旧 Run 后续请求）→ 废弃 Agent → 超时提示 → 结束
           slot.holder.controller.abort();
           this.deps.discardAgent(userId);
-          finish();
+          finish("timeout");
           void this.deps
             .replyStream(token, streamId, TIMEOUT_REPLY, true)
             .catch(() => undefined);
@@ -112,11 +113,11 @@ export class AgentRunner {
           const answer = await slot.agent.prompt(question);
           if (finished) return; // 迟到结果：Run 已结束（超时），直接丢弃
           const content = answer.trim().length > 0 ? answer : EMPTY_REPLY;
-          finish();
+          finish("completed");
           void this.deps.replyStream(token, streamId, content, true).catch(() => undefined);
         } catch {
           if (finished) return;
-          finish();
+          finish("error");
           void this.deps.replyStream(token, streamId, RUN_ERROR_REPLY, true).catch(() => undefined);
         }
       })();

@@ -208,7 +208,11 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
   const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 10));
 
   // P1–P3: 正常完成
-  const run1 = runner.run("u1", "正常问题", "tok1");
+  const runEndReasons: string[] = [];
+  const onRunEnd = (reason: string) => {
+    runEndReasons.push(reason);
+  };
+  const run1 = runner.run("u1", "正常问题", "tok1", onRunEnd);
   await tick();
   check("P1 Run 开始即发送占位语（finish=false）", replies.length === 1 && replies[0].content.includes("正在查询") && replies[0].finish === false, JSON.stringify(replies));
   check("P1b 占位语之后 Agent 已被调用（prompt 挂起等待）", slots.get("u1")!.st.calls === 1);
@@ -216,10 +220,13 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
   await run1;
   check("P2 正常答案以 finish=true 发送", replies.length === 2 && replies[1].content === "正常答案" && replies[1].finish === true, JSON.stringify(replies));
   check("P3 正常路径不废弃 Agent 实例", discarded.length === 0);
+  check("P3b 正常完成 onRunEnd 恰一次且原因 completed（供 observer 记录准确结束原因）",
+    runEndReasons.length === 1 && runEndReasons[0] === "completed", JSON.stringify(runEndReasons));
 
   // P4–P7: 超时路径
+  runEndReasons.length = 0;
   replies.length = 0;
-  const run2 = runner.run("u2", "会超时的问题", "tok2");
+  const run2 = runner.run("u2", "会超时的问题", "tok2", onRunEnd);
   await tick();
   const slot2 = slots.get("u2")!.slot;
   timerBox.fn?.(); // 手动触发超时
@@ -228,10 +235,13 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
   check("P5 超时提示以 finish=true 发送", replies.length === 2 && replies[1].content.includes("超时") && replies[1].finish === true, JSON.stringify(replies));
   check("P6 超时废弃 Agent 实例（防 Context 污染）", discarded.includes("u2") && !slots.has("u2"));
   check("P7 超时即 abort（旧 Run 无法再发起模型请求）", slot2.holder.controller.signal.aborted === true);
+  check("P7b 超时路径 onRunEnd 恰一次且原因 timeout（observer 记录准确结束原因）",
+    runEndReasons.length === 1 && runEndReasons[0] === "timeout", JSON.stringify(runEndReasons));
 
   // P8: 迟到结果不进入回复链
+  runEndReasons.length = 0;
   replies.length = 0;
-  const run3 = runner.run("u3", "迟到测试", "tok3");
+  const run3 = runner.run("u3", "迟到测试", "tok3", onRunEnd);
   await tick();
   const st3 = slots.get("u3")!.st;
   timerBox.fn?.(); // 先超时
@@ -244,6 +254,8 @@ section("P. 超时控制（runId 失效 / 迟到丢弃 / 实例废弃 / abort）
     replies.length === afterTimeout && !replies.some((r) => r.content === "迟到的答案"),
     JSON.stringify(replies)
   );
+  check("P8b 迟到 resolve 不再触发 onRunEnd（结束记录恰一次）",
+    runEndReasons.length === 1 && runEndReasons[0] === "timeout", JSON.stringify(runEndReasons));
 
   // P9: 新 Run 替换 holder 内的 controller（旧 abort 不影响新 Run）
   const run4 = runner.run("u2", "超时后的新问题", "tok4");
@@ -288,8 +300,35 @@ section("Q. 话术卫生（确认环节已删除，仅保留忙碌提示与内�
     { sql: "SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = '报餐管理'" },
     dcsCtx
   );
-  check("Q4 查询输出格式正常", permOk.output.includes("返回 1 行") && !permOk.isError);
+  check("Q4 未授权旧 SQL 明确拒绝", permOk.output.includes("forbidden") && permOk.isError === true);
   setDbClientFactoryForTest(null);
+}
+
+
+section("并发 Run 结束回调隔离");
+{
+  const timers: (() => void)[] = [];
+  const resolvers = new Map<string, (text: string) => void>();
+  const reasons: string[] = [];
+  const replies: string[] = [];
+  const runner = new AgentRunner({
+    getSlot: user => ({ agent: { prompt: () => new Promise<string>(resolve => { resolvers.set(user, resolve); }) }, holder: { controller: new AbortController() } }),
+    discardAgent: () => undefined,
+    replyStream: async (_token, _id, content, finish) => { if (finish) replies.push(content); },
+    newStreamId: () => "test",
+    schedule: fn => { timers.push(fn); return () => undefined; },
+  });
+  const a = runner.run("A", "q", null, reason => { reasons.push(`A:${reason}`); throw new Error("observer failed"); });
+  const b = runner.run("B", "q", null, reason => { reasons.push(`B:${reason}`); });
+  await Promise.resolve();
+  timers[0]();
+  await a;
+  resolvers.get("B")!("B answer");
+  await b;
+  resolvers.get("A")!("late A");
+  await Promise.resolve();
+  check("并发 A 超时 B 正常，回调各一次且异常不阻断回复",
+    reasons.join(",") === "A:timeout,B:completed" && replies.length === 2 && replies.includes("B answer") && !replies.includes("late A"));
 }
 
 console.log(`\n========== Channel 层测试结果 ==========`);

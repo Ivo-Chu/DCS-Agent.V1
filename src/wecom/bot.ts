@@ -20,6 +20,8 @@ import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 import type { TextMessage, WsFrame } from "@wecom/aibot-node-sdk";
 import { createDcsAgent, type DcsAgentHolder } from "../dcs/agent-factory.ts";
 import { loadEnvLocal } from "../dcs/env-local.ts";
+import type { Agent } from "../core/agent.ts";
+import type { DcsToolContext } from "../dcs/session.ts";
 
 loadEnvLocal();
 import { resolveIdentityAsync, type DcsIdentity } from "../dcs/identity.ts";
@@ -28,25 +30,14 @@ import { closeDbClient } from "../dcs/db/client.ts";
 import { AgentRunner, type UserAgentSlot } from "./agent-runner.ts";
 import { BUSY_PROMPT, ConversationManager } from "./conversation.ts";
 import { MsgIdDedup } from "./dedup.ts";
+import { attachRunObserver } from "../observability/observer.ts";
 
 const UNKNOWN_IDENTITY_REPLY =
   "暂时无法识别您的 DCS 员工身份，请联系管理员。";
 const GROUP_CHAT_REPLY = "暂时仅支持单聊咨询，请在单聊中与我对话。";
 
-/**
- * 工具调用参数摘要（单行化 + 截断），用于测试期观测日志。
- * 只进本地控制台，不进入员工可见的企微回复。
- */
-function summarizeToolArgs(args: unknown): string {
-  const s = JSON.stringify(args) ?? "";
-  const collapsed = s.replace(/\s+/g, " ");
-  return collapsed.length > 160 ? `${collapsed.slice(0, 160)}…` : collapsed;
-}
-
-interface UserAgentEntry extends UserAgentSlot {
-  /** 每 Run 统计（方案 v2 §9：观察真实 Case 的 Loop 深度，非生产观测系统）。 */
-  stats: { turns: number; toolCalls: number };
-}
+/** 企微侧 Agent 条目（无额外状态：工具展示/统计由 observability observer 统一承担）。 */
+type UserAgentEntry = UserAgentSlot;
 
 /**
  * 消息入口已解析的身份（两级链路：identity.json 覆盖 → S2_Employee 数据库）。
@@ -87,27 +78,11 @@ async function main(): Promise<void> {
       // 是同一个 holder——超时取消能真正到达模型请求（2026-09-28 修复：
       // 旧实现复制 controller 初始值，替换 entry 后取消信号失效）
       const holder: DcsAgentHolder = { controller: new AbortController() };
-      const stats = { turns: 0, toolCalls: 0 };
       const session = createSession(identity, userId);
       const agent = createDcsAgent({ session, holder });
-      // 简单统计：每轮 AssistantMessage 计 1 turn，每次工具完成计 1 toolCall
-      // 工具级观测日志（2026-09-24 方案C）：→ 打印调用的工具与参数（SQL 等），
-      // ← 打印耗时与结果摘要——区分"没查对表"与"真没有数据"全靠它
-      const toolTimings = new Map<string, number>();
-      agent.subscribe((e) => {
-        if (e.type === "assistant_message") stats.turns++;
-        else if (e.type === "tool_execution_start") {
-          toolTimings.set(e.toolCallId, Date.now());
-          console.log(`[tool] → ${e.toolName} ${summarizeToolArgs(e.args)}`);
-        } else if (e.type === "tool_execution_end") {
-          stats.toolCalls++;
-          const startedAt = toolTimings.get(e.toolCallId);
-          toolTimings.delete(e.toolCallId);
-          const ms = startedAt !== undefined ? Date.now() - startedAt : -1;
-          console.log(`[tool] ← ${e.toolName}（${ms}ms${e.isError ? "，出错" : ""}）：${e.summary}`);
-        }
-      });
-      entry = { agent, holder, stats };
+      // 工具展示与调用统计由 observability observer 统一承担（唯一权威来源，
+      // 2026-10-13 收敛：删除旧 [tool] →/← 手工打印与本地 stats，避免双重展示）
+      entry = { agent, holder };
       agents.set(userId, entry);
       console.log(
         `[bot] 已为用户 ${userId} 创建 Agent（${identity.name}/${identity.employeeNo}` +
@@ -144,25 +119,33 @@ async function main(): Promise<void> {
     actions: {
       notifyBusy: (token) => replyText(token, BUSY_PROMPT),
       runAgent: async (userId, question, token) => {
-        // 方案 v2 §9：每 Run 记录 turns / toolCalls（简单日志，Run 结束打印）
-        let stats: { turns: number; toolCalls: number } | null = null;
         try {
           getSlot(userId); // 确保已创建（防御性兜底会抛错，交由 runner.run 处理）
-          const entry = agents.get(userId);
-          if (entry) {
-            stats = entry.stats;
-            stats.turns = 0;
-            stats.toolCalls = 0;
-          }
         } catch {
           // getSlot 失败交由 runner.run 统一处理
         }
+        // 日志观测：中文终端日志 + logs/*.jsonl（与 CLI/Web 同一事件流）
+        // 模型/提供方标识由 run_start 事件携带（factory 统一从 Provider 配置获取）
+        const entry = agents.get(userId);
+        const observer = entry
+          ? attachRunObserver((entry as UserAgentEntry).agent as Agent<DcsToolContext>, {
+              channel: "WeCom",
+            })
+          : null;
+        // runner 内部结束原因（超时/异常路径 core 不产生 run_end）：
+        // 由 observer.end 依此记录准确原因；observer 幂等，正常 run_end 已
+        // 终结时 end() 是 no-op
+        let runnerReason: "timeout" | "error" | "completed" | null = null;
         try {
-          await runner.run(userId, question, token);
+          await runner.run(userId, question, token, (reason) => {
+            runnerReason = reason;
+          });
         } finally {
-          if (stats) {
-            console.log(`[bot] run 统计 userid=${userId} turns=${stats.turns} toolCalls=${stats.toolCalls}`);
-          }
+          // F3：准确结束原因落盘（timeout/error 来自 runner；正常完成时
+          // run_end 已终结，end("detached") 是 no-op）
+          const reason = runnerReason === "timeout" ? "timeout" : "detached";
+          void observer?.end(reason).catch(() => undefined);
+          observer?.detach();
         }
       },
     },

@@ -2,11 +2,14 @@
  * Web Channel 层确定性测试。
  * 注入假身份解析与假 Agent，不依赖 LLM / Oracle / 真实身份数据；
  * 通过真实 HTTP（随机端口）验证静态页、建档、鉴权、SSE 流式问答、
- * busy 拒绝、reset 丢弃实例。
+ * busy 拒绝、reset 丢弃实例，以及 Run 日志闭环（正常/超时/断开恰一次落盘）。
  *
  * 运行：npm run test:web
  */
 import type { AddressInfo } from "node:net";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createWebServer, type AgentLike } from "../src/web/server.ts";
 import type { AgentEvent } from "../src/core/events.ts";
@@ -46,6 +49,9 @@ class FakeAgent implements AgentLike {
   private readonly listeners = new Set<(e: AgentEvent) => void>();
   readonly calls: string[] = [];
 
+  /** 是否按 core 协议发 run_start/run_end（observer 依赖 run_start 建立 runId 归属）。 */
+  emitRunEvents = true;
+
   constructor(
     private readonly impl?: (q: string, emit: (e: AgentEvent) => void) => Promise<string>
   ) {}
@@ -59,20 +65,51 @@ class FakeAgent implements AgentLike {
 
   async prompt(question: string): Promise<string> {
     this.calls.push(question);
+    const runId = `web-test-${this.calls.length}-${Math.random().toString(16).slice(2, 8)}`;
     const emit = (e: AgentEvent): void => {
       for (const fn of this.listeners) fn(e);
     };
-    if (this.impl) return this.impl(question, emit);
+    if (this.emitRunEvents) {
+      emit({ type: "run_start", runId, startedAt: new Date().toISOString() } as AgentEvent);
+    }
+    const finishRun = (): void => {
+      if (this.emitRunEvents) {
+        emit({
+          type: "run_end",
+          runId,
+          status: "completed",
+          reason: "completed",
+          elapsedMs: 1,
+          modelCalls: 1,
+          toolCalls: 0,
+        } as AgentEvent);
+      }
+    };
+    if (this.impl) {
+      try {
+        const answer = await this.impl(question, emit);
+        finishRun();
+        return answer;
+      } catch (err) {
+        finishRun();
+        throw err;
+      }
+    }
     emit({ type: "message_delta", text: "你好，" });
-    emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "query_dcs_data", args: {} });
+    emit({ type: "tool_execution_start", runId, toolCallId: "t1", toolName: "query_dcs_data", args: {}, turn: 1, step: 1 });
     emit({
       type: "tool_execution_end",
+      runId,
       toolCallId: "t1",
       toolName: "query_dcs_data",
       isError: false,
       summary: "工具结果摘要（不应转发给前端）",
+      turn: 1,
+      step: 1,
+      durationMs: 1,
     });
     emit({ type: "message_delta", text: "这是回答。" });
+    finishRun();
     return "你好，这是回答。";
   }
 }
@@ -426,6 +463,174 @@ section("W7. 超时清理不误删新实例（discardEntryIfCurrent）");
   );
   check("W7c 超时废弃后新提问创建了新实例", w7AgentCalls === 2, `calls=${w7AgentCalls}`);
   server7.close();
+}
+
+// ---------------------------------------------------------------------------
+// 场景 W8：Run 日志闭环（正常 / 超时 / 客户端断开：结束记录恰一次 + 落盘）
+// ---------------------------------------------------------------------------
+
+section("W8. Run 日志闭环（正常 / 超时 / 断开：恰一次 run_end 且缓冲落盘）");
+
+/** 解析 logsDir 下全部 JSONL 文件为 { 文件名 → 记录数组 }。 */
+function readAllJsonl(logsDir: string): Map<string, Record<string, unknown>[]> {
+  const out = new Map<string, Record<string, unknown>[]>();
+  if (!fs.existsSync(logsDir)) return out;
+  for (const f of fs.readdirSync(logsDir).filter((n) => n.endsWith(".jsonl"))) {
+    const records = fs.readFileSync(path.join(logsDir, f), "utf8")
+      .trim()
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    out.set(f, records);
+  }
+  return out;
+}
+
+/** 等待指定条件成立（带超时），用于替代固定睡眠。 */
+async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await sleep(20);
+  }
+  return cond();
+}
+
+{
+  const w8LogsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dcs-web-logs-"));
+  let logsFlushedResolver: (() => void) | null = null;
+  let logsFlushed: Promise<void> = Promise.resolve();
+  const armFlushWait = (): void => {
+    logsFlushed = new Promise<void>((r) => {
+      logsFlushedResolver = r;
+    });
+  };
+  const w8Server = createWebServer({
+    resolveIdentity: async (code) => (code === "10086" ? TEST_IDENTITY : null),
+    createAgent: () => new FakeAgent(agentImpl),
+    budgetMs: 150,
+    staticDir: fileURLToPath(new URL("../../DCS Agent.web", import.meta.url)),
+    logger: () => undefined,
+    logsDir: w8LogsDir,
+    awaitLogs: async () => {
+      logsFlushedResolver?.();
+    },
+  });
+  await new Promise<void>((resolve) => w8Server.listen(0, resolve));
+  const base8 = `http://127.0.0.1:${(w8Server.address() as AddressInfo).port}`;
+
+  const sResp = await fetch(`${base8}/api/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: "10086" }),
+  });
+  const token8 = ((await sResp.json()) as { token?: string }).token ?? "";
+  const headers8 = { "Content-Type": "application/json", Authorization: `Bearer ${token8}` };
+
+  // ---- W8-1 正常路径：run_end 事件闭环，恰好一次结束记录 ----
+  {
+    agentImpl = undefined; // 默认实现：发 run_start → 工具 → run_end
+    const resp = await fetch(`${base8}/api/chat`, {
+      method: "POST",
+      headers: headers8,
+      body: JSON.stringify({ question: "正常问题" }),
+    });
+    const events = await readSse(resp);
+    check("W8-1 正常 SSE 流程有 final（业务不回归）",
+      events.some((e) => e.type === "final"));
+    const ok = await waitFor(() => {
+      const all = readAllJsonl(w8LogsDir);
+      for (const records of all.values()) {
+        const ends = records.filter((r) => r.event === "run_end");
+        if (ends.length > 0) return true;
+      }
+      return false;
+    });
+    check("W8-1 正常路径 JSONL 落盘且 run_end 恰好一次（status=completed）", ok && (() => {
+      const all = readAllJsonl(w8LogsDir);
+      for (const records of all.values()) {
+        const ends = records.filter((r) => r.event === "run_end");
+        if (ends.length === 1 && ends[0].status === "completed" && ends[0].reason === "completed") return true;
+      }
+      return false;
+    })());
+  }
+
+  // ---- W8-2 超时路径：end("timeout") 记录准确原因且恰好一次 ----
+  {
+    const filesBefore = readAllJsonl(w8LogsDir).size;
+    armFlushWait();
+    // 挂起 Agent：永不 resolve，必然触发预算超时
+    agentImpl = async () => new Promise<string>(() => undefined);
+    await fetch(`${base8}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
+    const resp = await fetch(`${base8}/api/chat`, {
+      method: "POST",
+      headers: headers8,
+      body: JSON.stringify({ question: "会超时的问题" }),
+    });
+    const events = await readSse(resp);
+    check("W8-2 超时路径 SSE 收到 timeout（业务行为不变）",
+      events.some((e) => e.type === "timeout"));
+    // 等待 flush 完成（awaitLogs 钩子在 observer.end("timeout") 后触发）
+    await Promise.race([logsFlushed, sleep(2000)]);
+    const ok = await waitFor(() => {
+      const all = readAllJsonl(w8LogsDir);
+      if (all.size <= filesBefore) return false;
+      return true;
+    }, 1500);
+    check("W8-2 超时路径 JSONL 落盘（短 Run 也有日志文件）", ok);
+    let timeoutEnds = 0;
+    let reasonOk = false;
+    for (const records of readAllJsonl(w8LogsDir).values()) {
+      const ends = records.filter((r) => r.event === "run_end" && r.reason === "timeout");
+      if (ends.length > 0) {
+        timeoutEnds += ends.length;
+        if (ends.length === 1 && ends[0].status === "failed") reasonOk = true;
+      }
+    }
+    check("W8-2 超时结束记录恰好一次且原因准确（reason=timeout）",
+      timeoutEnds === 1 && reasonOk, `timeoutEnds=${timeoutEnds}`);
+  }
+
+  // ---- W8-3 客户端断开路径：end("disconnected") 恰好一次 ----
+  {
+    armFlushWait();
+    agentImpl = async () => new Promise<string>(() => undefined); // 挂起
+    await fetch(`${base8}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
+    const controller = new AbortController();
+    const pending = fetch(`${base8}/api/chat`, {
+      method: "POST",
+      headers: headers8,
+      body: JSON.stringify({ question: "会被中断的问题" }),
+      signal: controller.signal,
+    }).catch(() => undefined); // 客户端主动中止 → res close
+    await sleep(80); // 确保请求已建立、Run 已开始
+    controller.abort();
+    await pending;
+    await Promise.race([logsFlushed, sleep(2000)]);
+    const ok = await waitFor(() => {
+      for (const records of readAllJsonl(w8LogsDir).values()) {
+        if (records.some((r) => r.event === "run_end" && r.reason === "disconnected")) return true;
+      }
+      return false;
+    }, 1500);
+    let disconnectEnds = 0;
+    for (const records of readAllJsonl(w8LogsDir).values()) {
+      disconnectEnds += records.filter((r) => r.event === "run_end" && r.reason === "disconnected").length;
+    }
+    check("W8-3 断开路径结束记录恰好一次且原因准确（reason=disconnected）",
+      ok && disconnectEnds === 1, `disconnectEnds=${disconnectEnds}`);
+    agentImpl = undefined;
+  }
+
+  // ---- W8-4 多 Run 归属：共享终端时 runId 前缀可区分（检查终端行带 [runId]）----
+  // 已由 W3/W4 的并发覆盖（observer 终端行统一带 [runId] 前缀，见 formatter/observer tag()）
+  check("W8-4 多 Run JSONL 文件名带 runId 后缀（同目录可区分归属）", (() => {
+    const names = [...readAllJsonl(w8LogsDir).keys()];
+    return names.length >= 2 && names.every((n) => /_[a-z0-9-]+\.jsonl$/i.test(n));
+  })(), JSON.stringify([...readAllJsonl(w8LogsDir).keys()]));
+
+  w8Server.close();
 }
 
 // ---------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 process.env.LLM_BASE_URL = "http://localhost:8000/v1";
 // test/cli-fixture.mjs — CLI 展示层验证用的本地假模型（无外部请求）。
 // 模式由环境变量 CLI_PROBE 决定：
@@ -5,6 +6,7 @@ process.env.LLM_BASE_URL = "http://localhost:8000/v1";
 // - args：模型用内部路径作检索关键词（R4：参数与摘要不得明文显示路径）
 process.env.LLM_API_KEY = "cli-display-fixture";
 const mode = process.env.CLI_PROBE;
+if (mode === "slow-log") fs.promises.appendFile = () => new Promise(() => {});
 let call = 0;
 const frame = (delta, finish_reason) =>
   `data: ${JSON.stringify({ choices: [{ delta, finish_reason }] })}\n\ndata: [DONE]\n\n`;
@@ -17,13 +19,17 @@ const tool = (name, args, finish = "tool_calls") =>
 globalThis.fetch = async () => {
   const i = call++;
   let body;
-  if (mode === "length") {
+  if (mode === "unsafe-answer") {
+    body = text("TEST_REPLY Luxshare/Controllers/Synthetic.cs");
+  } else if (mode === "slow-log") {
+    body = text("慢日志回答");
+  } else if (mode === "length") {
     body = tool("query_dcs_data", { sql: "SELECT 1 FROM DUAL" }, "length");
   } else {
     // args 模式
     body =
       i === 0
-        ? tool("investigate_dcs_code", { query: "Luxshare.DCS.WebApi/Controllers/ReviewProbe.cs" })
+        ? tool("investigate_dcs_code", { operation: "search", pattern: "Luxshare.DCS.WebApi/Controllers/ReviewProbe.cs" })
         : text("暂时无法确认，请联系管理员。");
   }
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });

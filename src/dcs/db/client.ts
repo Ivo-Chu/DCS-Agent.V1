@@ -14,10 +14,11 @@ import oracledb from "oracledb";
 export interface DbQueryResult {
   columns: string[];
   rows: unknown[][];
+  truncated?: boolean;
 }
 
 export interface DbClient {
-  execute(sql: string): Promise<DbQueryResult>;
+  execute(sql: string, binds?: Record<string, string | number>): Promise<DbQueryResult>;
   close(): Promise<void>;
 }
 
@@ -51,21 +52,23 @@ class OracleDbClient implements DbClient {
     return this.pool;
   }
 
-  async execute(sql: string): Promise<DbQueryResult> {
+  async execute(sql: string, binds: Record<string, string | number> = {}): Promise<DbQueryResult> {
     const pool = await this.getPool();
     const connection = await pool.getConnection();
     try {
       connection.callTimeout = SQL_CALL_TIMEOUT_MS;
-      const result = await connection.execute(sql, [], {
+      await connection.execute("SET TRANSACTION READ ONLY");
+      const result = await connection.execute(sql, binds, {
         outFormat: oracledb.OUT_FORMAT_ARRAY,
-        maxRows: 1000, // format 层负责 100 行截断；此处仅防极端值
+        maxRows: 1001, // 多取一行，明确报告驱动侧截断
       });
       return {
         columns: (result.metaData ?? []).map((m) => m.name),
-        rows: (result.rows ?? []) as unknown[][],
+        rows: ((result.rows ?? []) as unknown[][]).slice(0, 1000),
+        truncated: (result.rows?.length ?? 0) > 1000,
       };
     } finally {
-      await connection.close();
+      try { await connection.rollback(); } finally { await connection.close(); }
     }
   }
 
