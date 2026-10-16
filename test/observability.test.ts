@@ -592,7 +592,7 @@ section("O10. ToolResult 三层（hook 前后差异 / 尾部诊断信息）");
     description: "返回带尾部诊断的假工具",
     parameters: { type: "object" },
     async execute(): Promise<ToolOutput> {
-      return { output: `查询成功：返回 1 行。\n${"A".repeat(200)}\n${longTail}` };
+      return { output: `查询成功：返回 1 行。\n${"A".repeat(200)}\n${longTail}`, details: { rowCount: 1, ...{ databaseQueries: [{ sql: "SELECT :actor FROM DUAL", binds: { actor: "10086", token: "NEVER_LOG_TRACE_TOKEN" }, durationMs: 4 }] } } };
     },
   };
   const agent = new Agent<unknown>({
@@ -624,6 +624,7 @@ section("O10. ToolResult 三层（hook 前后差异 / 尾部诊断信息）");
     toolEnd?.resultChanged === true &&
     typeof toolEnd?.rawResult === "string" && !(toolEnd.rawResult as string).includes("[hook已处理]"),
     JSON.stringify(toolEnd?.resultChanged));
+  check("O10-6 参数化SQL日志保留员工绑定但遮蔽凭据", jsonlRaw.includes("SELECT :actor FROM DUAL") && jsonlRaw.includes("10086") && !jsonlRaw.includes("NEVER_LOG_TRACE_TOKEN"));
   // 相同场景：无 hook 时 resultChanged=false
   const agent2 = makeAgent([
     { toolCalls: [{ name: "query_dcs_data", arguments: '{"sql":"SELECT 1 FROM DUAL"}' }] },

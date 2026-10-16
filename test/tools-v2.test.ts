@@ -139,10 +139,10 @@ try {
   await test("B 非法表名/超量/操作参数错误拒绝", async () => {
     for (const a of [{ operation: "describe", tables: ["X; DROP TABLE X"] }, { operation: "describe", tables: Array(6).fill("S2_ROLE") }, { operation: "list" }, { operation: "list", keyword: "x", limit: -1 }, { operation: "describe", tables: ["S2_ROLE"], keyword: "x" }]) assert.equal(decode(await schema.execute(a as any, ctx)).status, "invalid_args");
   });
-  await test("B 未授权表/身份在访问数据库前拒绝", async () => {
+  await test("B 非批准Schema/未知身份在访问数据库前拒绝", async () => {
     dbCalls = [];
-    assert.equal(decode(await schema.execute({ operation: "describe", tables: ["S2_R_REGACCOM"] }, ctx)).status, "forbidden");
-    assert.equal(decode(await schema.execute({ operation: "list", keyword: "x" }, { session: createMockSession() })).status, "forbidden");
+    assert.equal(decode(await schema.execute({ operation: "describe", tables: ["S2_R_REGACCOM"], schema: "OTHER" }, ctx)).status, "denied");
+    assert.equal(decode(await schema.execute({ operation: "list", keyword: "x" }, { session: createMockSession() })).status, "unverifiable");
     assert.equal(dbCalls.length, 0);
   });
   await test("B Schema 发现唯一/歧义/无效配置", async () => {
@@ -154,20 +154,20 @@ try {
   });
   await test("B 元数据权限不足", async () => {
     fail = "ORA-01031: insufficient privileges";
-    assert.equal(decode(await schema.execute({ operation: "list", keyword: "x" }, ctx)).status, "forbidden"); fail = "";
+    assert.equal(decode(await schema.execute({ operation: "list", keyword: "x" }, ctx)).status, "unverifiable"); fail = "";
   });
   await test("C 授权 SELECT 使用可信工号绑定", async () => {
     dbCalls = [];
     const a = decode(await query.execute({ query: "self_permissions" }, ctx));
     assert.equal(a.status, "success"); assert.equal(a.rowCount, 1);
-    assert.equal(dbCalls.length, 1); assert.equal(dbCalls[0].binds?.employeeNo, "10086");
+    assert.equal(dbCalls.length, 1); assert.equal(dbCalls[0].binds?.actor, "10086");
     assert.ok(dbCalls[0].sql.startsWith("SELECT")); assert.ok(!dbCalls[0].sql.includes("10086"));
   });
   await test("C Web/CLI/伪管理员拒绝", async () => {
     dbCalls = [];
     for (const source of ["web", "cli"] as const) {
       const session = createMockSession(); session.user.source = source; session.user.roles = ["管理员", "Developer"];
-      assert.equal(decode(await query.execute({ query: "self_permissions" }, { session })).status, "forbidden");
+      assert.equal(decode(await query.execute({ query: "self_permissions" }, { session })).status, "unverifiable");
     }
     assert.equal(dbCalls.length, 0);
   });
@@ -177,19 +177,19 @@ try {
     try {
       dbCalls = [];
       assert.equal(decode(await query.execute({ query: "self_permissions" }, web)).status, "success");
-      assert.equal(dbCalls[0].binds?.employeeNo, "31177047");
+      assert.equal(dbCalls[0].binds?.actor, "31177047");
       assert.equal(decode(await schema.execute({ operation: "list", keyword: "S2_" }, web)).status, "success");
       dbCalls = [];
-      assert.equal(decode(await query.execute({ query: "self_permissions" }, { session: createMockSession() })).status, "forbidden");
-      assert.equal(decode(await query.execute({ sql: "SELECT * FROM S2_EMPLOYEE" }, web)).status, "forbidden");
-      assert.equal(decode(await schema.execute({ operation: "describe", tables: ["S2_EMPLOYEE"] }, web)).status, "forbidden");
+      assert.equal(decode(await query.execute({ query: "self_permissions" }, { session: createMockSession() })).status, "unverifiable");
+      assert.equal(decode(await query.execute({ sql: "SELECT * FROM S2_EMPLOYEE" }, web)).status, "unsupported");
+      assert.equal(decode(await schema.execute({ operation: "describe", tables: ["S2_EMPLOYEE"], schema: "OTHER" }, web)).status, "denied");
       assert.equal(dbCalls.length, 0);
     } finally { delete process.env.DCS_ALLOW_WEB_TEST_IDENTITY; }
-    assert.equal(decode(await query.execute({ query: "self_permissions" }, web)).status, "forbidden");
+    assert.equal(decode(await query.execute({ query: "self_permissions" }, web)).status, "unverifiable");
   });
   await test("C 任意 SQL/AND OR 优先级/跨员工/函数/DML 不可绕过", async () => {
     dbCalls = [];
-    for (const sql of ["SELECT * FROM S2_EMPLOYEE", "SELECT * FROM X WHERE EmpCode='10086' AND X=1 OR 1=1", "SELECT * FROM X WHERE EmpCode='10087'", "SELECT pkg.mutate() FROM dual", "WITH FUNCTION x RETURN NUMBER IS BEGIN RETURN 1; END; SELECT x FROM dual", "DELETE FROM X", "SELECT COUNT(*) FROM S2_R_REGACCOM WHERE DT BETWEEN '2026-10-03' AND '2026-10-10'"]) assert.equal(decode(await query.execute({ sql }, ctx)).status, "forbidden");
+    for (const sql of ["SELECT * FROM S2_EMPLOYEE", "SELECT * FROM X WHERE EmpCode='10086' AND X=1 OR 1=1", "SELECT * FROM X WHERE EmpCode='10087'", "SELECT pkg.mutate() FROM dual", "WITH FUNCTION x RETURN NUMBER IS BEGIN RETURN 1; END; SELECT x FROM dual", "DELETE FROM X", "SELECT COUNT(*) FROM S2_R_REGACCOM WHERE DT BETWEEN '2026-10-03' AND '2026-10-10'"]) assert.equal(decode(await query.execute({ sql }, ctx)).status, "unsupported");
     assert.equal(dbCalls.length, 0);
     assert.equal(decode(await query.execute({ query: "self_permissions", employeeNo: "10087" } as any, ctx)).status, "invalid_args");
   });
@@ -199,7 +199,7 @@ try {
     answer = { columns: ["ROLE_NAME"], rows: Array.from({ length: 105 }, () => ["13812345678"]) };
     const a = decode(await query.execute({ query: "self_permissions" }, ctx));
     assert.equal(a.rowCount, 105); assert.equal(a.returnedRowCount, 100); assert.equal(a.truncated, true);
-    assert.ok(!a.message.includes("13812345678"));
+    assert.ok(!JSON.stringify(a.rows).includes("13812345678"));
     answer = { columns: Array(10).fill("COL"), rows: Array.from({ length: 100 }, () => Array(10).fill("x".repeat(500))) };
     const b = await query.execute({ query: "self_permissions" }, ctx); assert.equal(decode(b).truncated, true); assert.ok(b.output.length < 64000);
   });
@@ -211,6 +211,84 @@ try {
     }
     fail = "";
     setDbClientFactoryForTest(() => null); assert.equal(decode(await query.execute({ query: "self_permissions" }, ctx)).status, "unavailable"); setDbClientFactoryForTest(() => fake);
+  });
+  await test("V2.1 BLL/Data源码可读且Token变量保留，凭据字面值隐藏", async () => {
+    await write("Libraries/Luxshare.DCS.BLL/Rule.cs", 'public void Check(CancellationToken token) { Use(token); }\nvar token = "NEVER_EXPOSE";');
+    await write("Libraries/Luxshare.DCS.Data/Entity.cs", 'class Entity {}');
+    const r = await code.execute({ operation: "read", path: "Libraries/Luxshare.DCS.BLL/Rule.cs" }, ctx);
+    assert.match(r.output, /CancellationToken token/); assert.match(r.output, /Use\(token\)/); assert.ok(!r.output.includes("NEVER_EXPOSE"));
+    assert.equal((await runCode({ operation: "find", pattern: "Entity.cs" })).count, 1);
+  });
+  await test("V2.1 任意可见业务表的元数据允许，但其他owner拒绝", async () => {
+    const r = await schema.execute({ operation: "describe", tables: ["S2_R_REGACCOM"] }, ctx);
+    assert.equal(r.isError, undefined);
+    assert.ok(dbCalls.some(c => Object.values(c.binds ?? {}).includes("S2_R_REGACCOM")));
+  });
+  await test("V2.1 目录/未知查询/身份篡改参数不访问数据库", async () => {
+    dbCalls = [];
+    assert.equal(decode(await query.execute({ query: "list_available" }, ctx)).queries.length, 4);
+    assert.equal(decode(await query.execute({ query: "all_employees" }, ctx)).status, "unsupported");
+    for (const params of [{ actor: "B" }, { employeeNo: "X' OR 1=1" }, { limit: 101 }, { offset: -1 }, { kind: "invalid" }]) {
+      assert.equal(decode(await query.execute({ query: "position_certificates", params }, ctx)).status, "invalid_args");
+    }
+    assert.equal(dbCalls.length, 0);
+  });
+  await test("V2.1 A本人/B授权他人/C无授权与未知授权：先验权后读数", async () => {
+    const calls: Array<{ sql: string; binds: any }> = [];
+    let broken = false;
+    const secured: DbClient = { async close() {}, async execute(sql, binds) {
+      calls.push({ sql, binds });
+      if (sql.startsWith("SELECT 1")) {
+        if (broken) throw new Error("NJS-530: password=NEVER_EXPOSE");
+        // B仅有源码中的专用权限；C的管理员角色声明不起作用。
+        return { columns: ["OK"], rows: binds?.actor === "B" ? [[1]] : [] };
+      }
+      return { columns: ["EMP_CODE"], rows: [[binds?.target ?? binds?.actor]] };
+    } };
+    const employee = (id: string) => ({ session: createSession({ employeeNo: id, name: id }, "verified-" + id) });
+    setDbClientFactoryForTest(() => secured);
+    try {
+      assert.equal(decode(await query.execute({ query: "position_certificates" }, employee("A"))).status, "success");
+      assert.equal(calls.length, 1); assert.equal(calls[0].binds.actor, "A"); assert.equal(calls[0].binds.target, "A");
+      calls.length = 0;
+      assert.equal(decode(await query.execute({ query: "position_certificates", params: { employeeNo: "OTHER" } }, employee("B"))).status, "success");
+      assert.equal(calls.length, 2); assert.ok(calls[0].sql.includes("S2_AppMyMenu"));
+      assert.equal(calls[0].binds.permission, "shanggangzhengchaxun");
+      assert.match(calls[1].sql, /EXISTS.*S2_AppMyMenu/s); assert.match(calls[1].sql, /t.State=1/); assert.match(calls[1].sql, /t.State=2/);
+      assert.equal(calls[1].binds.actor, "B"); assert.equal(calls[1].binds.target, "OTHER");
+      calls.length = 0;
+      const c = employee("C"); c.session.user.roles = ["管理员", "Developer"];
+      assert.equal(decode(await query.execute({ query: "position_certificates", params: { employeeNo: "OTHER" } }, c)).status, "denied");
+      assert.equal(calls.length, 1); assert.ok(calls.every(x => x.sql.startsWith("SELECT 1")));
+      broken = true; calls.length = 0;
+      const unknown = await query.execute({ query: "position_certificates", params: { employeeNo: "OTHER" } }, c);
+      assert.equal(decode(unknown).status, "unverifiable"); assert.equal(calls.length, 1); assert.ok(!unknown.output.includes("NEVER_EXPOSE"));
+    } finally { setDbClientFactoryForTest(() => fake); }
+  });
+  await test("V2.1 宿舍厂区边界、授权错误、餐饮本人、分页与日志", async () => {
+    const calls: Array<{ sql: string; binds: any }> = [];
+    let empty = false;
+    const scoped: DbClient = { async close() {}, async execute(sql, binds) {
+      calls.push({ sql, binds });
+      if (sql.startsWith("SELECT 1")) return { columns: ["OK"], rows: binds?.company === "C1" ? [[1]] : [] };
+      return { columns: ["ID"], rows: empty ? [] : [[1], [2], [3]] };
+    } };
+    setDbClientFactoryForTest(() => scoped);
+    try {
+      const params = { companyCode: "C1", roomId: 7, limit: 2 };
+      const r = await query.execute({ query: "dorm_room_residents", params }, ctx), body = decode(r);
+      assert.equal(body.status, "success"); assert.equal(body.returnedRowCount, 2); assert.equal(body.nextOffset, 2);
+      assert.equal(calls.length, 2); assert.match(calls[1].sql, /BITAND\(dp.PowerTypes,1\)=1/);
+      assert.match(calls[1].sql, /c.CompanyCode=:company/); assert.equal(calls[1].binds.actor, "10086");
+      assert.equal((r.details as any).databaseQueries.length, 2);
+      calls.length = 0;
+      assert.equal(decode(await query.execute({ query: "dorm_room_residents", params: { ...params, companyCode: "C2" } }, ctx)).status, "denied");
+      assert.equal(calls.length, 1);
+      calls.length = 0; empty = true;
+      assert.equal(decode(await query.execute({ query: "self_book_dinners_today" }, ctx)).status, "empty");
+      assert.match(calls[0].sql, /EmpCode=:actor AND BookStatus<>2/); assert.equal(calls[0].binds.actor, "10086");
+      assert.equal(decode(await query.execute({ query: "self_book_dinners_today", params: { employeeNo: "other" } }, ctx)).status, "invalid_args");
+    } finally { setDbClientFactoryForTest(() => fake); }
   });
   await test("D Fake Model Schema → Code → Query → Final 完整消息接线", async () => {
     answer = { columns: ["ROLE_NAME", "PERMISSION_NAME"], rows: [["员工", "本人菜单"]] };
@@ -271,7 +349,7 @@ try {
       setDbClientFactoryForTest(() => fake);
     }
   });
-  console.log(`Tool V2: ${passed} 组全部通过（离线；不代表真实模型效率或 Oracle 上线验证）`);
+  console.log(`Tool V2.1: ${passed} 组全部通过（离线；不代表真实模型效率或 Oracle 上线验证）`);
 } finally {
   for (const [key, value] of Object.entries({ DCS_SOURCE_ROOT: saved.root, DCS_RG_PATH: saved.rg, DCS_DB_SCHEMA: saved.owner, DCS_ALLOW_WEB_TEST_IDENTITY: saved.webTest })) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   setDbClientFactoryForTest(null); resetIdentityCache();

@@ -7,7 +7,7 @@ import { maskPii } from "./hooks.ts";
 
 export const CODE_LIMITS = { find: 50, search: 20, read: 80, readMax: 200,
   files: 15000, bytes: 2 * 1024 * 1024, chars: 24000, lineChars: 1000, timeoutMs: 10000 };
-const PROJECTS = ["Luxshare.DCS.WebApi", "Luxshare.DCS.WebApp", "Common"];
+const PROJECTS = ["Luxshare.DCS.WebApi", "Luxshare.DCS.WebApp", "Common", "Libraries/Luxshare.DCS.BLL", "Libraries/Luxshare.DCS.Data"];
 const BLOCKED = new Set("bin obj node_modules dist .git .vs packages upload images content css documents template app_data ffmpeg refdll scripts fonts echarts logs log".split(" "));
 const EXTENSIONS = new Set([".cs", ".cshtml", ".js", ".ts", ".config", ".json", ".xml"]);
 export interface InvestigateDcsCodeArgs {
@@ -16,7 +16,7 @@ export interface InvestigateDcsCodeArgs {
 }
 function allowed(rel: string, file: boolean): boolean {
   const parts = rel.split("/");
-  return PROJECTS.includes(parts[0]) && !parts.some(p => BLOCKED.has(p.toLowerCase())) &&
+  return PROJECTS.some(project => rel === project || rel.startsWith(project + "/")) && !parts.some(p => BLOCKED.has(p.toLowerCase())) &&
     (!file || (EXTENSIONS.has(path.extname(rel).toLowerCase()) &&
       !/(^|\/)(secret[^/]*|\.env[^/]*|[^/]*\.(?:min\.|pfx$|key$|pem$))/i.test(rel)));
 }
@@ -64,21 +64,16 @@ function rg(args: string[], cwd: string, timeout: number, signal?: AbortSignal):
     });
   });
 }
-function safeLine(line: string): string {
-  // 配置凭据可能跨行：配置文件在读取时整体屏蔽；源码敏感赋值整行隐藏。
-  if (/password|pwd|secret|token|api.?key|access.?key|connectionstring|private.key|bearer\s/i.test(line)) return "[敏感配置行已隐藏]";
-  return maskPii(line);
-}
+function safeLine(line: string): string { return maskPii(line); }
 function safeLines(source: string): string[] {
-  let continuation = false;
-  return source.split(/\r?\n/).map(line => {
-    const sensitive = /password|pwd|secret|token|api.?key|access.?key|connectionstring|private.key|bearer\s/i.test(line);
-    if (sensitive || continuation) {
-      continuation = !line.includes(";");
-      return "[敏感配置行已隐藏]";
-    }
-    return safeLine(line);
-  });
+  // 只遮蔽凭据赋值中的字面值，不因CancellationToken/变量名/方法签名屏蔽业务代码。
+  const mask = (value: string) => value.replace(/[^\r\n]/g, "*");
+  const redacted = source
+    .replace(/(\b(?:password|pwd|secret|token|api_?key|access_?(?:key|token)|connectionString)\b["']?\s*[=:]\s*)(@?"(?:""|\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/gi,
+      (_all, prefix: string, value: string) => prefix + mask(value))
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, mask)
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{12,}/gi, "$1***");
+  return redacted.split(/\r?\n/).map(safeLine);
 }
 export const investigateDcsCodeTool: ToolDefinition<InvestigateDcsCodeArgs, DcsToolContext> = {
   name: "investigate_dcs_code", label: "DCS源码调查",

@@ -210,67 +210,25 @@ DcsToolContext（可信，运行时注入）
 
 ---
 
-## 6. 工具清单（当前 4 个；2026-10-14 Tool V2）
+## 6. 工具清单（当前 4 个；2026-10-14 Tool V2.1）
 
 | 工具 | 实际参数 | 执行范围 |
 |---|---|---|
 | `search_dcs_knowledge` | `query` | 原有 Embedding → LanceDB → Rerank，未调整检索实现 |
-| `investigate_dcs_code` | `operation=find/search/read`，`pattern/path/mode/offset/limit` | 白名单源码；find 最多50，search最多20，read默认80/最多200行 |
-| `inspect_dcs_schema` | `operation=list/describe`，`keyword/tables/limit` | 可信企微身份或显式开启的 Web 测试身份；仅本人菜单查询所需4张表的结构；list默认20/最多50，describe最多5表 |
-| `query_dcs_data` | `query=self_permissions`；旧 `sql` 调用明确拒绝 | 可信企微当前员工（或服务端显式开启 Web 测试身份）的角色/菜单分配，工号绑定；其他业务授权尚未确认 |
+| `investigate_dcs_code` | `operation=find/search/read`，`pattern/path/mode/offset/limit` | WebApi/WebApp/Common及Libraries下BLL/Data两个指定项目；find最多50，search最多20，read默认80/最多200行 |
+| `inspect_dcs_schema` | `operation=list/describe`，`keyword/tables/limit/schema` | 批准DCS Schema内数据库账号可见的元数据，不含业务样例；list默认20/最多50，describe最多5表 |
+| `query_dcs_data` | `query=list_available`或目录查询名，`params` | 本人菜单、岗位证书、本人当天客人订餐、显式DormAdmin厂区内指定房间在住人员 |
 
-- 工具注册顺序与上表一致。Core、Provider、maxTurns、Context 和执行顺序本次未改动。
-- 源码使用外部 **ripgrep**（本机已检测）；无需新增 npm 依赖。Windows/Linux 需在 PATH 安装 `rg`，或通过 `DCS_RG_PATH` 配置可执行文件绝对路径；缺失会明确报错，无隐式降级。使用 `execFile` 参数数组，不执行模型 Shell。
-- `find` 支持 `*`/`?` 文件名或路径通配符；`search` 默认 literal 连续字面量，不拆分空格关键词；regex 使用 ripgrep 正则，`宿舍|入住` 表示或。find/search 的 offset 从0计；read 从1计。所有返回路径可用于 read。
-- 保留 `Luxshare.DCS.WebApi / Luxshare.DCS.WebApp / Common` 项目白名单及目录/扩展名过滤。严格拒绝路径穿越和符号链接；配置文件只可发现文件名，不读取内容；源码敏感行及后续赋值行隐藏。每次读取最多2MiB、扫描预算10秒、候选最多15000、结果最多24000字符；截断/扫描不完整显式标记。不缓存文件内容，避免旧代码结果。
-- Schema 使用 Oracle ALL_* 系统视图、绑定参数和明确 OWNER。沿用 `DCS_DB_SCHEMA` 或身份链路发现结果；未发现时仅查询 S2_EMPLOYEE 的唯一 OWNER，多 Schema 拒绝。允许结构仅 `S2_USERROLE/S2_ROLE/S2_ROLEPERMISSION/S2_PERMISSION`，不对员工开放整个库；未授权表拒绝，无业务样例。主键/外键来自真实约束，复合键按 POSITION 对齐；其他业务关系标记 unknown。
-- 数据查询只执行程序生成的固定参数化 SELECT。默认不接受 Web 工号建档；仅受控测试可在 .env.local 设置 DCS_ALLOW_WEB_TEST_IDENTITY=true 并重启 Web，按输入工号查询本人角色/菜单及相关4张表结构（输入任意有效工号即视为该员工，生产必须关闭）。CLI mock、角色名称、自称管理员均不能授权；自由 SQL 一律 forbidden。`guardSql` 只是保守文本预检查，不是安全解析器，也不是生产授权边界。
-- Oracle 连接池复用现有实现；增加 binds、只读事务及 finally 回滚，保留20秒单次调用超时，驱动多取一行判断1000行截断，展示最多100行/约60KiB。结构化输出区分 success/empty/sql_error/forbidden/timeout/unavailable/invalid_args，保留错误码而不回传原始连接异常。
-- **部署阻塞**：尚未验证真实数据库最小只读账号、真实约束/表字段和企微部署身份映射；宿舍的厂区授权与统计口径未完成业务验收。因此“所有员工宿舍入住数”不执行数据查询，也不以拒绝冒充效率提升。Web/CLI 的数据库功能需接入正式身份后才可开放。
-- 详见 [Tool V2 交付与验证记录](docs/tool-v2-delivery.md)，含实际 JSON Schema、兼容性变化、文件清单与人工确认项。历史 §9 的旧工具行为不再代表当前接口。
-
-### 6.1 本地知识库（search_dcs_knowledge 的后端）
-
-**架构**（2026-09-29 由 RAGFlow 方案替换：取消 Docker / WSL2 / RAGFlow 部署要求，无需任何本地服务部署）：资料导入与检索全部在本地完成，仅向量化与重排序调用集团接口。
-
-```
-导入（npm run knowledge:ingest，可重复执行）：
-本地文档（MD / TXT / DOCX / 可提取文字的 PDF，knowledge/documents/）
-  → 提取正文（mammoth / pdf-parse；扫描版 PDF 与空文档明确报错，.doc 提示转存 .docx）
-  → 结构分块（标题链保留 / 表格重复表头 / 段落 600–1000 字 / 超长句切 + 100 字重叠 / PDF 保留页码）
-  → 集团 Embedding 批量向量化（Qwen3-Embedding-8B；输入=《标题》+章节+正文；首请求探测实际维度，不硬编码）
-  → 本地 LanceDB（data/knowledge/，保存原文、向量、出处与导入清单）
-
-检索（Agent 提问时）：
-问题 → 集团 Embedding → LanceDB 余弦召回（默认 20 候选）
-  → 集团 Rerank 排序（Qwen3-Reranker-8B，默认前 5；输入同 embedding=标题+章节+正文）
-  → 完整原文片段 + 出处（片段正文绝不截断，末尾限制条件保留）→ 现有 Agent 组织答案并引用出处
-```
-
-**导入增量语义**：新文件入库；未变化跳过；已修改文件**原子替换**（先写入新分块、成功后再删旧分块——写入失败时旧版本完整保留仍可检索；删除失败的新版残留由下次导入的孤儿清理移除）；已删除文件同步移除；单文件失败保留此前可用版本。更新前显式校验向量维度与索引一致（不一致拒绝写入并提示重建）。更换 Embedding 模型 / 维度 / 分块规则后索引不兼容——打开时报错要求删除索引目录重建，绝不混用向量。
-
-**DOCX 能力边界**：当前 DOCX 走纯文本提取，不保留 Word 标题层级与表格结构（表格会被摊平为文本行）。普通说明文档可直接试用；**若正式资料以制度表格为主，导入后必须人工核对检索结果**，不能默认"支持 DOCX"等于结构完整。结构化表格建议转存 Markdown 表格后导入。
-
-**使用步骤**：
-
-1. 放资料：`knowledge/documents/`（目录不存在时导入命令自动创建；已 gitignored 不入库；不递归子目录、不扫工作区）
-2. 配置环境变量（见 .env.example 知识库段）：`DCS_EMBEDDING_URL` + `DCS_EMBEDDING_API_KEY` 必填（完整请求 URL，代码不追加路径）；`DCS_RERANK_URL` 可选——未配置时检索降级为向量排序并在结果中注明
-3. 导入：`npm run knowledge:ingest`（失败项退出码 1，成功为 0）
-4. 照常启动：`npm run web`（或 `wecom:bot` / `dev`），无需其他操作
-
-**接口对接口径**：Embedding 按响应 `data[].index` 对位（不假设顺序）、校验数量/维度/数值有效性；Rerank 按 `results[].index` 找回本地候选、校验越界与重复、`top_n` 不超过候选数；两接口均不发送文档中冲突的 `prompt` 字段（按完整请求示例实施）。请求超时覆盖响应正文读取全过程。
-
-**当前已验证状态**：离线全链路 46 项测试通过（真实 LanceDB 临时库 + mock 集团接口：含中文同义检索「取消报餐」→「撤销订餐」、增量同步四态、单文件失败保留、Rerank 降级、请求取消、超时）。**集团真实接口与真实文档导入未验证**（缺接口地址与凭据），见 §9.9。测试文档模板：`test/acceptance-cases/knowledge-testdoc.md`（虚构系统手册 + 5 个验证问题）。
-
-**当前工具**：知识库 + 源码 + 受控 Schema + 授权数据查询，共四个；生产注册中无 Mock 工具。
-
-
-
-**不提供 `get_user_info`**：身份已由 DcsSession 提供，不存在模型查询其他员工身份的场景。
-
-**身份链路已接入真实库**（2026-09-24）：企微 userid → S2_Employee.UserId 自动解析工号/姓名/部门（仅在职；见 §5.2）；identity.json 降级为可选的手动覆盖文件。角色字段暂为空（ADM 权限表接入前）。
-
----
+- Core、Provider、模型、maxTurns、Context、RAG与登录链路未调整，未引入新依赖或运行框架。
+- 源码使用外部 **ripgrep**；需PATH安装`rg`，或设置`DCS_RG_PATH`。`execFile`传参，不执行模型Shell。find支持文件名/路径glob；search默认连续literal，多词或需regex，例如`宿舍|入住`。find/search的offset从0计，read从1计。
+- 保留目录/扩展名/真实路径限制；配置只发现文件名不读内容。凭据字面值隐藏，正常Token变量/签名保留。每文件2MiB、扫描10秒、候选15000、输出24000字符；截断/不完整显式标记。
+- Schema沿用服务端`DCS_DB_SCHEMA`或身份链路发现结果；否则唯一发现S2_EMPLOYEE的OWNER。不允许模型切换到其他Schema。真实外键按POSITION对齐；其他业务关系标unknown。元数据可见不代表业务数据授权。
+- 业务执行只接受固定参数化SELECT。岗位证书跨员工授权复用`AppMyMenu`专用代码`shanggangzhengchaxun`；宿舍复用`R_DataPermission`的DormAdmin厂区范围。请求者始终绑定会话，查询内再次包含范围条件；不继承特殊开发者绕过。岗位证书不是后台重点岗位管理列表。
+- Web测试仍需显式`DCS_ALLOW_WEB_TEST_IDENTITY=true`并重启；按输入工号模拟员工（生产必须关闭），测试开关不授予业务权限。CLI mock、角色名、自称管理员不能授权。
+- `list_available`返回目录和各查询参数Schema，不代表当前员工已获授权。状态区分`unsupported/denied/unverifiable/empty/success`以及连接/SQL/超时错误。自由SQL为`unsupported`，不执行；不得把工具缺能力说成DCS禁止业务。
+- 保留Oracle连接池、只读事务、finally回滚、20秒超时。查询支持offset/limit，最多返回100行；多取一行判断hasMore。`rowCount`是取回行数（含探测行），不是总命中数。JSONL记录参数化SQL、绑定值、行数、耗时与安全错误码，凭据脱敏。
+- **验证边界**：离线规则和回归已实现，真实Oracle返回NJS-530（主机解析失败），用户要求本次仅完成离线。真实业务数据/实际员工可见范围及真实模型行为未验证。未实现后台岗位完整列表、部门汇总、历史宿舍统计和管理地点报餐查询。
+- 完整Schema、查询示例、源码证据及测试结果见[Tool V2.1交付记录](docs/tool-v21-delivery.md)和[权限证据](docs/tool-v21-permissions.md)。旧V2交付文档仅作历史记录。
 
 ## 7. 运行与测试
 
@@ -402,7 +360,7 @@ npm run web   # http://localhost:8787
 
 ### 7.3 测试覆盖
 
-2026-10-14 Tool V2 当前验证见 [交付记录](docs/tool-v2-delivery.md)。下面带旧日期/数量的记录是历史快照；新工具替换了旧源码接口测试，旧自由 SQL 剧本改用测试专用 fixture，生产授权独立验证。
+2026-10-14 Tool V2.1 当前验证见 [交付记录](docs/tool-v21-delivery.md)。下面带旧日期/数量的记录是历史快照；新工具替换了旧源码接口测试，旧自由 SQL 剧本改用测试专用 fixture，生产授权独立验证。
 
 | 测试 | 结果 |
 |---|---|

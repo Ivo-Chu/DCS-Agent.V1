@@ -1,0 +1,285 @@
+{
+  "tools": [
+    {
+      "name": "search_dcs_knowledge",
+      "description": "检索 DCS 知识库中的文档资料（操作手册、管理制度、通知公告、常见问题 FAQ 等）。适合回答「怎么操作」「制度规定是什么」「某功能怎么用」类文档问题；返回相关原文片段与文档标题及章节，回答时注明简洁出处（如：依据：《报餐操作手册》—取消报餐章节）。查实时业务数据（报餐记录、审批状态等）请改用 query_dcs_data。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "检索关键词或问题（针对手册/制度/FAQ 的措辞检索效果最好）。"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "investigate_dcs_code",
+      "description": "定位并读取源码实现。find 使用文件名/路径 glob（如 *Dorm*.cs）；search 默认 literal 连续字面量匹配，空格不会自动拆词；regex 使用 ripgrep 正则，可用 宿舍|入住 表示或。read 用返回的相对 path 读取行号。offset：find/search 为从0开始的结果偏移，read 为从1开始的行号。配置文件内容不暴露。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "find",
+              "search",
+              "read"
+            ]
+          },
+          "pattern": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "path": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "literal",
+              "regex"
+            ],
+            "default": "literal"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      }
+    },
+    {
+      "name": "inspect_dcs_schema",
+      "description": "调查允许暴露的数据库元数据，不读取业务记录。list 按 keyword 字面子串找表（默认20，最多50）；describe 一次最多5张表，返回字段、主键及数据库实际外键。开发诊断可查看批准的DCS Schema内数据库账号可见的表结构；元数据可见不代表业务数据授权。没有外键不代表不存在业务关系，未知关系不可猜测。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "可选，必须与服务端批准/发现的DCS Schema一致"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "list",
+              "describe"
+            ]
+          },
+          "keyword": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 5,
+            "uniqueItems": true
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 20
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      }
+    },
+    {
+      "name": "query_dcs_data",
+      "description": "用list_available发现固定业务查询及参数。本人和授权他人均可查询，由程序绑定请求者并验证真实业务规则。菜单不等于数据范围。unsupported是工具未覆盖，denied是明确无授权，unverifiable是无法验权，empty仅表示当前查询条件无记录。自由SQL不执行；元数据使用inspect_dcs_schema。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "enum": [
+              "list_available",
+              "self_permissions",
+              "position_certificates",
+              "self_book_dinners_today",
+              "dorm_room_residents"
+            ]
+          },
+          "params": {
+            "type": "object",
+            "description": "业务参数由list_available返回的各查询Schema定义；不能指定请求者或SQL。"
+          },
+          "sql": {
+            "type": "string",
+            "description": "旧参数只返回unsupported，不执行。"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "sql"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "queryCatalog": [
+    {
+      "name": "self_permissions",
+      "description": "本人角色/菜单分配，非业务范围授权；可按角色或菜单过滤及分页。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "roleKeyword": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "menuKeyword": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "position_certificates",
+      "description": "GetCertInfo证书列表：重点岗位正常且未禁用，一般岗位通过且未禁用。可查本人；查他人需AppMyMenu专门授权。不是后台岗位定义/全部申请列表。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "employeeNo": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "目标员工；不覆盖会话请求者。缺省为本人。"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "all",
+              "technical",
+              "general"
+            ],
+            "default": "all"
+          },
+          "jobId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "keyword": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "self_book_dinners_today",
+      "description": "BookDinnerApi.GetComplitInfo的本人分支：当天未取消的客人订餐。不是所有报餐系统，不开放管理地点或历史范围。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "dorm_room_residents",
+      "description": "GetDormitory在指定厂区/房间的在住人员投影；必须具有该厂区显式DormAdmin权限。不含历史入住统计或开发者绕过。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "companyCode": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "roomId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          }
+        },
+        "required": [
+          "companyCode",
+          "roomId"
+        ]
+      }
+    }
+  ]
+}

@@ -2,17 +2,44 @@ import type { DcsToolContext } from "../session.ts";
 import { getDiscoveredSchema } from "../identity.ts";
 import type { DbClient } from "./client.ts";
 
-// 仅本人权限查询所需的结构；不是全库元数据授权。
-export const METADATA_TABLES = ["S2_USERROLE", "S2_ROLE", "S2_ROLEPERMISSION", "S2_PERMISSION"];
+// 仅用于服务端确定的Oracle Schema和元数据标识符。
 export const IDENTIFIER = /^[A-Z][A-Z0-9_$#]{0,127}$/;
 export function requireTrustedEmployee(ctx: DcsToolContext): string {
   const u = ctx?.session?.user;
   // Web 工号仅在显式开启本地测试开关时接受；CLI mock、模型 roles 不能授权。
   const allowWebTest = u?.source === "web" && process.env.DCS_ALLOW_WEB_TEST_IDENTITY === "true";
   if (!u || (u.source !== "wecom" && !allowWebTest) || !u.userId || !/^[a-zA-Z0-9_-]{1,64}$/.test(u.employeeNo)) {
-    throw new Error("forbidden: 需要企微可信身份；Web 测试需由服务端启用 DCS_ALLOW_WEB_TEST_IDENTITY=true，CLI 模拟身份不能授权数据库访问。");
+    throw new Error("unverifiable: 缺少可用的员工会话；Web本机测试需由服务端启用 DCS_ALLOW_WEB_TEST_IDENTITY=true，测试开关不授予业务权限。");
   }
   return u.employeeNo;
+}
+
+export type AuthorizationDecision = { status: "authorized"; basis: string } |
+  { status: "denied" | "unverifiable"; message: string; code?: string };
+
+/** GetCertInfo: 只允许本人，或当前请求者具有明确的跨员工证书查询授权。 */
+export async function authorizeCertificates(db: DbClient, owner: string, actor: string, target: string): Promise<AuthorizationDecision> {
+  if (actor === target) return { status: "authorized", basis: "ElearningController.GetCertInfo: 本人证书" };
+  try {
+    const result = await db.execute(`SELECT 1 FROM ${owner}.S2_AppMyMenu WHERE EmpCode = :actor AND INSTR(MenuCodes, :permission) > 0 AND ROWNUM <= 1`,
+      { actor, permission: "shanggangzhengchaxun" });
+    return result.rows.length ? { status: "authorized", basis: "GetCertInfo: 请求者AppMyMenu明确授予跨员工证书查询" } :
+      { status: "denied", message: "当前员工没有GetCertInfo要求的跨员工上岗证查询授权；不代表没有其他页面的权限。" };
+  } catch (error) { return unknownAuthorization(error); }
+}
+
+/** GetDormitory + GetCompanyCodes(DormAdmin)：只复用显式厂区授权，不移植IsDeveloper绕过。 */
+export async function authorizeDormitory(db: DbClient, owner: string, actor: string, company: string): Promise<AuthorizationDecision> {
+  try {
+    const r = await db.execute(`SELECT 1 FROM ${owner}.S2_R_DataPermission p JOIN ${owner}.S2_Company c ON c.Code=p.CompanyCode
+      WHERE p.EmpCode=:actor AND p.CompanyCode=:company AND BITAND(p.PowerTypes,1)=1 AND ROWNUM<=1`, { actor, company });
+    return r.rows.length ? { status: "authorized", basis: "R_DataPermissionSet.GetCompanyCodes: 显式DormAdmin厂区授权" } :
+      { status: "denied", message: "未授予该厂区的显式DormAdmin权限；Agent不继承DCS特殊开发者绕过。" };
+  } catch (error) { return unknownAuthorization(error); }
+}
+function unknownAuthorization(error: unknown): AuthorizationDecision {
+  return { status: "unverifiable", message: "业务授权查询失败，无法确定权限；未读取目标员工业务数据。",
+    code: /(?:ORA|NJS|DPI)-\d+/.exec(String(error))?.[0] };
 }
 export async function resolveSchema(db: DbClient): Promise<string> {
   let owner = process.env.DCS_DB_SCHEMA?.trim().toUpperCase() || getDiscoveredSchema();
@@ -24,14 +51,4 @@ export async function resolveSchema(db: DbClient): Promise<string> {
   }
   if (!owner || !IDENTIFIER.test(owner)) throw new Error("unavailable: DCS_DB_SCHEMA 无效或 Schema 发现存在歧义。");
   return owner;
-}
-
-/** 实体映射与 UserRoleSet.GetRoleCodesByEmpCode 已核对。只返回本人分配的角色/菜单，不能推导数据范围。 */
-export function selfPermissionsSql(owner: string): string {
-  if (!IDENTIFIER.test(owner)) throw new Error("unavailable: Schema 无效");
-  return `SELECT r.Name AS ROLE_NAME, p.Name AS PERMISSION_NAME FROM ${owner}.S2_UserRole ur
-    JOIN ${owner}.S2_Role r ON r.Code = ur.RoleCode
-    LEFT JOIN ${owner}.S2_RolePermission rp ON rp.RoleCode = ur.RoleCode
-    LEFT JOIN ${owner}.S2_Permission p ON p.Id = rp.PermissionId
-    WHERE ur.EmpCode = :employeeNo ORDER BY r.Code, p.Id`;
 }

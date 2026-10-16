@@ -1,6 +1,8 @@
+> ⛔ V2历史交付；当前实现与范围见README及tool-v21-delivery.md。
+
 # Tool V2 实施交付记录
 
-状态：现行（本次交付记录；运行现状以 README.md 和 src/ 为准）
+状态：存档（本次交付记录；运行现状以 README.md 和 src/ 为准）
 日期：2026-10-14
 取代关系：本次工具接口取代旧 query/contextLines 源码搜索及开放 SQL 工具；不取代 Runtime
 

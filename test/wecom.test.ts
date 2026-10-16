@@ -300,7 +300,7 @@ section("Q. 话术卫生（确认环节已删除，仅保留忙碌提示与内�
     { sql: "SELECT MENU_NAME, ALLOWED_ROLE FROM S2_MENU WHERE MENU_NAME = '报餐管理'" },
     dcsCtx
   );
-  check("Q4 未授权旧 SQL 明确拒绝", permOk.output.includes("forbidden") && permOk.isError === true);
+  check("Q4 旧 SQL 明确标为未支持且不执行", permOk.output.includes("unsupported") && permOk.isError === true);
   setDbClientFactoryForTest(null);
 }
 

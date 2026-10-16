@@ -489,6 +489,7 @@ export function attachRunObserver(
             tool: e.toolName,
             durationMs: e.durationMs,
             isError: e.isError,
+            databaseQueries: redactValue((e.details as typeof e.details & { databaseQueries?: unknown })?.databaseQueries ?? null),
             rowCount: e.details?.rowCount ?? null,
             columns: e.details?.columns ?? null,
             truncated: e.details?.truncated ?? null,
