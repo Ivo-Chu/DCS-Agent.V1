@@ -22,6 +22,7 @@ import { createDcsToolHooks } from "./hooks.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 import type { DcsSession, DcsToolContext } from "./session.ts";
 import { dcsTools } from "./tools.ts";
+import type { ToolDefinition } from "../core/types.ts";
 
 /** 可变取消信号持有器（Channel 层持有并替换 controller，模型读取同一对象）。 */
 export interface DcsAgentHolder {
@@ -37,6 +38,8 @@ export interface CreateDcsAgentOptions {
   streamFn?: StreamFn;
   /** 单 Run 最大轮数，默认 24（测试期宽松安全阀，非生产参数）。 */
   maxTurns?: number;
+  /** Channel 专用工具（如 Web 菜单导航）；不改变核心四个 Tool。 */
+  extraTools?: ToolDefinition[];
 }
 
 export const DEFAULT_MAX_TURNS = 32;
@@ -45,7 +48,7 @@ export function createDcsAgent(opts: CreateDcsAgentOptions): Agent<DcsToolContex
   const { session, holder, streamFn, maxTurns = DEFAULT_MAX_TURNS } = opts;
   return new Agent<DcsToolContext>({
     systemPrompt: buildSystemPrompt(session),
-    tools: dcsTools,
+    tools: [...dcsTools, ...(opts.extraTools ?? [])],
     // signalProvider 每次模型调用求值：holder.controller 被 Channel 层替换后，
     // 下一轮模型请求立即使用新信号；被 abort 后旧 Run 无法再发起新请求
     streamFn: streamFn ?? createOpenAiStreamFn({

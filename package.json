@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "web": "tsx src/web/server.ts",
-    "check": "tsc --noEmit && tsx test/tools-v2.test.ts && tsx test/smoke.ts && tsx test/acceptance.ts && tsx test/cli-display.ts && tsx test/wecom.test.ts && tsx test/web.test.ts && tsx test/identity.test.ts && tsx test/agent-factory.test.ts && tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts && tsx test/observability.test.ts",
+    "check": "tsc --noEmit && tsx test/tools-v2.test.ts && tsx test/smoke.ts && tsx test/acceptance.ts && tsx test/cli-display.ts && tsx test/wecom.test.ts && tsx test/web.test.ts && tsx test/web-sso-navigation.test.ts && tsx test/navigation-pairing.test.ts && tsx test/web-navigation-bridge.test.ts && tsx test/identity.test.ts && tsx test/agent-factory.test.ts && tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts && tsx test/observability.test.ts && tsx test/web-run-ownership.test.ts && tsx test/web-sso-http.test.ts",
     "knowledge:e2e": "tsx scripts/knowledge-e2e.ts",
     "knowledge:ingest": "tsx scripts/knowledge-ingest.ts",
     "test": "tsx test/smoke.ts",
@@ -21,12 +21,13 @@
     "test:live": "tsx test/llm-live.ts",
     "test:live:db": "tsx test/live-db.ts",
     "test:observability": "tsx test/observability.test.ts",
-    "test:web": "tsx test/web.test.ts",
+    "test:web": "tsx test/web.test.ts && tsx test/web-sso-navigation.test.ts && tsx test/navigation-pairing.test.ts && tsx test/web-navigation-bridge.test.ts && tsx test/web-run-ownership.test.ts && tsx test/web-sso-http.test.ts",
     "test:wecom": "tsx test/wecom.test.ts",
     "typecheck": "tsc --noEmit",
     "wecom:bot": "tsx src/wecom/bot.ts",
     "wecom:echo": "tsx src/wecom/echo.ts",
-    "test:tools": "tsx test/tools-v2.test.ts"
+    "test:tools": "tsx test/tools-v2.test.ts",
+    "test:dcs": "node test/dcs-navigation.test.mjs && powershell -NoProfile -File test/dcs-sso-session.test.ps1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

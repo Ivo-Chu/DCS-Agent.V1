@@ -6,12 +6,16 @@ import type { DbClient } from "./client.ts";
 export const IDENTIFIER = /^[A-Z][A-Z0-9_$#]{0,127}$/;
 export function requireTrustedEmployee(ctx: DcsToolContext): string {
   const u = ctx?.session?.user;
-  // Web 工号仅在显式开启本地测试开关时接受；CLI mock、模型 roles 不能授权。
-  const allowWebTest = u?.source === "web" && process.env.DCS_ALLOW_WEB_TEST_IDENTITY === "true";
-  if (!u || (u.source !== "wecom" && !allowWebTest) || !u.userId || !/^[a-zA-Z0-9_-]{1,64}$/.test(u.employeeNo)) {
-    throw new Error("unverifiable: 缺少可用的员工会话；Web本机测试需由服务端启用 DCS_ALLOW_WEB_TEST_IDENTITY=true，测试开关不授予业务权限。");
+  if (!u?.userId || !/^[a-zA-Z0-9_-]{1,64}$/.test(u.employeeNo)) {
+    throw new Error("unverifiable: 缺少可用的员工会话。");
   }
-  return u.employeeNo;
+  if (u.source === "wecom") return u.employeeNo;
+  // Web 正式身份只信任 Node 服务端 SSO 校验成功后设置的标记；
+  // 显式测试开关仅用于本地调试。两者都不能由模型或浏览器提交。
+  const webTestAllowed = u.source === "web" && process.env.DCS_ALLOW_WEB_TEST_IDENTITY === "true";
+  if (u.source === "web" && u.authMethod === "dcs_sso") return u.employeeNo;
+  if (webTestAllowed) return u.employeeNo;
+  throw new Error("unverifiable: Web身份未通过DCS SSO校验；本地测试需服务端启用 DCS_ALLOW_WEB_TEST_IDENTITY=true。");
 }
 
 export type AuthorizationDecision = { status: "authorized"; basis: string } |

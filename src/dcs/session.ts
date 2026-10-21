@@ -1,26 +1,15 @@
-/**
- * dcs/session.ts
- * SessionUser / DcsSession / DcsToolContext 定义与构造。
- *
- * 身份属于 DCS Domain Layer，不属于通用 Agent Runtime：
- * core/types.ts 中不存在任何身份概念。
- *
- * v1 身份来源：直接构造 Mock Session（张三 / 10086 / 制造一部 / 普通员工）。
- * 未来正式身份链路：企微用户 → 可信 userid → 接入层 Identity Resolver
- * → userid → DCS employeeNo → 构造 DcsSession → 传入 Agent 的 toolContext。
- * 届时只替换本文件的 Session 构造方式，不修改 Agent Runtime。
- */
-
 export interface SessionUser {
   /** 身份来源通道。 */
   source: "cli" | "wecom" | "web";
   /** 通道侧身份。正式企微接入后为可信的企微 userid。 */
   userId: string;
-  /** DCS 工号。正式环境由接入层根据企微 userid 转换得到。 */
+  /** DCS 工号。正式环境由企微 userid / Web SSO 服务端解析得到。 */
   employeeNo: string;
   name: string;
   department?: string;
   roles: string[];
+  /** 身份验证方式。dcs_sso 仅允许 Node 服务端在 DCS CheckSSOCode 校验成功后构造。 */
+  authMethod?: "dcs_sso" | "manual_test";
 }
 
 export interface DcsSession {
@@ -54,13 +43,14 @@ export function createMockSession(): DcsSession {
 
 /**
  * 由已解析的 DCS 身份构造会话（企微 / Web 链路用）。
- * userid 来自通道侧可信身份（企微 body.from.userid / Web 通道的工号建档），
+ * userid 来自通道侧可信身份（企微 body.from.userid / Web 通道的服务端解析），
  * 身份字段来自 Identity Resolver；source 标识来源通道（默认 wecom）。
  */
 export function createSession(
   identity: { employeeNo: string; name: string; department?: string; roles?: string[] },
   userid: string,
-  source: "wecom" | "web" = "wecom"
+  source: "wecom" | "web" = "wecom",
+  authMethod?: "dcs_sso" | "manual_test"
 ): DcsSession {
   return {
     user: {
@@ -70,6 +60,7 @@ export function createSession(
       name: identity.name,
       department: identity.department,
       roles: identity.roles ?? [],
+      authMethod,
     },
   };
 }

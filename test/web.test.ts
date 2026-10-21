@@ -18,6 +18,9 @@ import type { DcsIdentity } from "../src/dcs/identity.ts";
 let passed = 0;
 let failed = 0;
 
+// 旧工号入口是显式本地测试能力，测试进程必须开启服务端开关。
+process.env.DCS_ALLOW_WEB_TEST_IDENTITY = "true";
+
 function check(name: string, cond: boolean, detail?: string): void {
   if (cond) {
     passed++;
@@ -164,7 +167,7 @@ section("W1. 静态页与建档");
 {
   const resp = await fetch(`${base}/`);
   const html = await resp.text();
-  check("GET / 返回 200 且包含产品名", resp.status === 200 && html.includes("DCS 智能体"));
+  check("GET / 返回 200 且包含产品名", resp.status === 200 && html.includes("DCS Agent"));
 }
 
 let token = "";

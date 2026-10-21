@@ -6,6 +6,17 @@
 
 ---
 
+## Web 第一版接入修复（2026-10-21）
+
+- DCS 入口调用 `Home/GetDcsAgentSSOCode`，签发只读取服务器登录 Session；原 `GetSSOCode` 保留。
+- Node 使用 `DCS_SSO_CHECK_URL` 校验 code 后查在职员工。正式环境关闭 `DCS_ALLOW_WEB_TEST_IDENTITY`；原数据授权规则不变。
+- `DCS_SSO_TIMEOUT_MS` 为 Node SSO HTTP 超时（默认 10000）；前端构建变量 `VITE_SSO_TIMEOUT_MS` 默认 15000。
+- Web Navigation Bridge 用 AsyncLocalStorage 保存 prompt 发起时的 Run；pending 绑定原 Session/entry/response。过期 Run 不能向新的 SSE 发动作。
+- 导航结果为 `{ ok, message }`；同名菜单使用“父级 / 菜单”消歧，仅允许授权菜单树中的内部页签页面。
+- `npm run test:web` 包含 Run 串线与 SSO HTTP 回归；`npm run test:dcs` 执行真实 Razor 导航/miniTab 和实际 C# action 的隔离测试。可用 `DCS_WEBAPP_ROOT` 指定主系统 WebApp 路径，默认同机 D:/work/DCS code/Luxshare.DCS.WebApp。
+- 前端仓库 `npm test` 验证 SSE/取消/导航清理/多轮文本；`npm run build` 后 `npm run test:browser-fixture` 提供仅本机的假 Session/SSE iframe，用于浏览器验证布局。
+- 隔离测试不代表 IIS、真实登录、Oracle、模型联调通过。传统 MVC 构建需要 Visual Studio WebApplication targets。
+
 ## 1. 项目定位
 
 自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）、**数据库结构**（`inspect_dcs_schema`）与**源码调查**（`investigate_dcs_code`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
@@ -15,7 +26,7 @@ User Prompt → Agent → AgentLoop → LLM → ToolCall → Tool Execution
 → ToolResult → LLM → Final Response → newMessages 写回 Agent Context
 ```
 
-身份链路：CLI 默认模拟身份；Web / 企微走真实身份解析（工号建档 / 企微 userid → S2_Employee 数据库解析，仅在职，见 §5.2）。
+身份链路：CLI 默认模拟身份；Web / 企微走真实身份解析（DCS SSO / 企微 userid → S2_Employee 数据库解析，仅在职，见 §5.2）。
 
 ---
 
