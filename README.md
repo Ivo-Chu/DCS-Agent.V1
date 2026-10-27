@@ -1,25 +1,41 @@
 # DCS Agent v1 — 功能与技术说明文档
 
 > 状态：**现行（项目唯一现状文档）**；docs/ 为决策历史、audit/ 为修复档案、docs/archive/ 为已废弃方案，冲突时以代码为准（详见 AGENTS.md）
-> DCS 员工智能助手：自研轻量 Agent Runtime + 企业微信机器人 / 网页端两个接入通道 + 真实 Oracle 数据查询、本地知识库（LanceDB + 集团 Embedding/Rerank）、受控元数据与 DCS 源码调查四个工具
-> 版本：v1.x · TypeScript / Node 22+ / ESM（运行时依赖：@wecom/aibot-node-sdk、oracledb）
+> DCS 员工智能助手：自研轻量 Agent Runtime + 企业微信机器人 / 网页端两个接入通道 + 真实 Oracle 数据查询、本地知识库（LanceDB + 集团 Embedding/Rerank）、数据库元数据与只读源码调查工具
+> 版本：v1.x · TypeScript / Node 22.13+ / ESM（运行时依赖：@wecom/aibot-node-sdk、oracledb）
 
 ---
 
-## Web 第一版接入修复（2026-10-21）
+## 本机日志查看页（2026-10-23）
 
-- DCS 入口调用 `Home/GetDcsAgentSSOCode`，签发只读取服务器登录 Session；原 `GetSSOCode` 保留。
-- Node 使用 `DCS_SSO_CHECK_URL` 校验 code 后查在职员工。正式环境关闭 `DCS_ALLOW_WEB_TEST_IDENTITY`；原数据授权规则不变。
-- `DCS_SSO_TIMEOUT_MS` 为 Node SSO HTTP 超时（默认 10000）；前端构建变量 `VITE_SSO_TIMEOUT_MS` 默认 15000。
-- Web Navigation Bridge 用 AsyncLocalStorage 保存 prompt 发起时的 Run；pending 绑定原 Session/entry/response。过期 Run 不能向新的 SSE 发动作。
-- 导航结果为 `{ ok, message }`；同名菜单使用“父级 / 菜单”消歧，仅允许授权菜单树中的内部页签页面。
-- `npm run test:web` 包含 Run 串线与 SSO HTTP 回归；`npm run test:dcs` 执行真实 Razor 导航/miniTab 和实际 C# action 的隔离测试。可用 `DCS_WEBAPP_ROOT` 指定主系统 WebApp 路径，默认同机 D:/work/DCS code/Luxshare.DCS.WebApp。
-- 前端仓库 `npm test` 验证 SSE/取消/导航清理/多轮文本；`npm run build` 后 `npm run test:browser-fixture` 提供仅本机的假 Session/SSE iframe，用于浏览器验证布局。
-- 隔离测试不代表 IIS、真实登录、Oracle、模型联调通过。传统 MVC 构建需要 Visual Studio WebApplication targets。
+- Agent Web 根地址直接打开显示日志页；DCS iframe 内仍显示原聊天界面，不更改 DCS 接入地址。
+- 使用现有 Web 服务，前端在 DCS Agent.web 执行 npm run build 后，重启 npm run web，本机访问 http://localhost:8787（以 WEB_PORT 为准）。
+- 左侧选择 Run，右侧按 Loop 展开 System Prompt、工具定义、Context、模型输出和工具执行；支持复制和手动刷新。
+- GET /api/logs 返回摘要列表，GET /api/log?file=... 返回指定日志；接口只接受本机连接，读取现有 logs 及 Web 子目录，不创建或续期聊天登录。
+- 新 JSONL 保存每轮工具 Schema、模型输出及完整上下文/工具结果（继续凭据脱敏，不再按 8000 字符截断）；终端保留既有摘要和展示上限。工具自身裁剪的数据不能由日志恢复。
+- 旧日志缺少的字段显示未记录，旧截断标志保留；不完整行显示数量。页面仅展示已落盘记录，没有 run_end 时显示尚无结束记录，不推断仍在运行。
+- Web 日志继续随会话过期清理。无新数据库、实时推送或桌面打包。
+- 新增验证：npm run test:logs（多轮完整输入输出、脱敏、旧/不完整日志及读取接口），已纳入 npm run check。
+
+## Web 多会话与本地过期（2026-10-22）
+
+- 复用 DCS Web 的 Home/GetSSOCode 和 WebApi 的 Account/CheckSSOCode。Node 配置 DCS_SSO_CHECK_URL（本机通常 http://localhost:19999/api/Account/CheckSSOCode）；无专用服务密钥、DCS 登录状态查询或退出通知。
+- DCS Web 与 WebApi 是两个服务，本机调试都需运行。正式环境沿用既有 WebApi 地址。DCS_ALLOW_WEB_TEST_IDENTITY 默认关闭。
+- Node 根据验证后的工号生成/恢复本地 Agent 会话。同一工号共享尚未过期的一组对话；不同用户隔离。agentSessionId 不依赖 DCS Session。
+- 连续 30 分钟无操作后主动清理本次全部对话、上下文和内容日志，并使所有相关 Token 失效。实际 API 操作续期；无心跳、无 DCS 巡检。运行中的回答不按空闲清理，结束后重新计算 30 分钟。
+- SQLite 保存到期时间；Node 重启只做本地过期处理，未过期会话重新 SSO 后恢复。停机期间不能执行清理，启动后补清理。
+- 关闭窗口保留未过期对话；过期前端不专门推送，下次操作重新认证并恢复新会话，不自动重发用户的问题。
+- 复用两表存储（logins 为本地会话范围、conversations 为对话）。旧数据仅增加 expires 列，按原 updated 时间加 30 分钟计算，已过期数据首次启动按规则清理；不直接删库或迁移到按工号永久保存。
+- GET/POST /api/conversations，GET/DELETE /api/conversation；聊天和导航结果均带 conversationId。保持同员工单 Run、完整上下文检查点和删除后不重新写回。
+- DCS 主页面加载自动打开助手（刷新也打开），单击图标重开；Layer 无遮罩。空对话显示固定功能介绍，不调用模型。
+- 助手使用 rdev/liquid-glass-react 1.1.1 的真实 SVG 折射组件：窗口折射层由前端构建产物 assets/dcs-glass.js 挂载在 DCS 父页面，输入框复用同一组件；父页面独立应用 18px 背景虚化，折射限制在边缘。滚动消息使用普通浅色衬底，不挂载逐条折射滤镜，装饰层不拦截点击。尺寸变化重建装饰层，关闭窗口卸载父页面组件。左上角会话入口复用闭合的 DCS 云形图案。前端 npm run build 同时生成聊天页面和父页面 IIFE 资源，构建后需刷新 DCS 主页面。完整位移效果以 Chromium 浏览器为准；Safari/Firefox 的效果受上游支持限制。
+- 导航复用 GetNewMenus 与 miniTab；已交给父页面的导航不因关闭助手或停止回答撤销，结果只回传原窗口。保留授权菜单、消息来源和请求对应关系。
+- Web 内容日志继续按会话/对话归属存放，不混入 CLI/企微日志。数据文件不得置于 dist。Node 要求 22.13+，使用内置 node:sqlite。
+- 验证命令：后端 npm run check、npm run test:dcs；前端 npm run typecheck、npm test、npm run build。隔离测试不等于真实 IIS/Oracle/模型联调通过。
 
 ## 1. 项目定位
 
-自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）、**数据库结构**（`inspect_dcs_schema`）与**源码调查**（`investigate_dcs_code`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
+自研一套**最小可用的轻量 Agent Runtime**（架构思想参考 Pi，零 Pi 依赖），面向 DCS 员工提供系统问题自助解答。当前工具为**知识库检索**（`search_dcs_knowledge`，本地解析 + LanceDB + 集团 Embedding/Rerank）、**数据库查询**（`query_dcs_data`）、**数据库结构**（`inspect_dcs_schema`）、**源码搜索/读取**（`search_dcs_code` / `read_dcs_code`）和**结果读取**（`read_dcs_result`），接入通道为**企业微信机器人**（`npm run wecom:bot`）与**网页端**（`npm run web`），另有 CLI REPL（`npm run dev`，默认模拟身份，用于开发调试）。
 
 ```
 User Prompt → Agent → AgentLoop → LLM → ToolCall → Tool Execution
@@ -177,17 +193,11 @@ Emitter 为同步实现，单个消费者异常不阻断事件流。不实现 `t
 
 ## 5. 身份与安全设计
 
-### 5.1 身份隔离（模型无法指定查询对象）
+### 5.1 当前身份与查询口径
 
-```
-DcsToolContext（可信，运行时注入）
-        ↓ ctx.session.user.employeeNo
-      工具真正查询的员工
-```
-
-- 四个工具的参数 Schema 中**不存在任何身份字段**——模型构造不出 `{"employeeNo": "10087"}` 这种越权查询
-- 模型只能指定业务参数（如 `menuName`、`dataType`、`keyword`）
-- `v1` 身份来源：`dcs/session.ts` 直接构造 Mock 会话（张三 / 10086 / 制造一部 / 普通员工）
+- Web SSO / 企微身份解析继续构造当前员工会话，供对话和原有菜单导航使用；CLI仍使用开发模拟身份。
+- 当前调查工具为受限源码读取 + 通用只读SQL。SQL和binds可以指定业务查询目标，不再由固定目录绑定员工级数据范围。
+- Schema和SQL工具使用数据库连接账号实际可见的对象；查询工具保留只读事务。此行为与历史Tool V2.1固定授权目录不同，现状以第6节及源码为准。
 
 ### 5.2 正式身份链路（2026-09-24 已实现，两级解析）
 
@@ -217,29 +227,33 @@ DcsToolContext（可信，运行时注入）
 
 ### 5.4 systemPrompt 防泄漏约束
 
-`dcs/prompt.ts` 包含：结论先行、禁技术细节（文件路径 / 类名 / SQL / 接口地址，且抗"自称管理员"式越狱）、不编造、≤200 字、工具编排规则（先权限后数据；源码检索结果仅内部诊断）+ 当前员工身份注入块（属 DCS 层行为，Core 不知道身份存在）。
+`dcs/prompt.ts` 按源码、元数据、SQL和文档组织证据；注入源码目录和当前员工身份。未知结构先调查、已知条件直接查询，大结果由受限工具继续读取；保持原知识库检索规则和依据证据作答要求。
 
 ---
 
-## 6. 工具清单（当前 4 个；2026-10-14 Tool V2.1）
+## 6. 工具清单（2026-10-23 只读调查）
 
-| 工具 | 实际参数 | 执行范围 |
+六个基础工具，Web 另注入现有菜单导航。保持单 Agent、单 Loop，不增加框架或依赖。
+
+| 工具 | 参数 | 当前行为 |
 |---|---|---|
-| `search_dcs_knowledge` | `query` | 原有 Embedding → LanceDB → Rerank，未调整检索实现 |
-| `investigate_dcs_code` | `operation=find/search/read`，`pattern/path/mode/offset/limit` | WebApi/WebApp/Common及Libraries下BLL/Data两个指定项目；find最多50，search最多20，read默认80/最多200行 |
-| `inspect_dcs_schema` | `operation=list/describe`，`keyword/tables/limit/schema` | 批准DCS Schema内数据库账号可见的元数据，不含业务样例；list默认20/最多50，describe最多5表 |
-| `query_dcs_data` | `query=list_available`或目录查询名，`params` | 本人菜单、岗位证书、本人当天客人订餐、显式DormAdmin厂区内指定房间在住人员 |
+| `search_dcs_code` | `mode/pattern/directory/glob/regex/contextLines/offset/limit` | files按路径glob找文件，text搜索文本/正则；直接调用rg，不经过Shell |
+| `read_dcs_code` | `files[{path,startLine,lineCount,startColumn}]` | 一次读取1–5个源码片段，返回行号和next续读位置 |
+| `read_dcs_result` | `resultFile/select/offset/limit` | 只读SQL/结构结果文件，选择JSON条目或长字符串分页 |
+| `inspect_dcs_schema` | `operation=search/describe/definition` | 查询字段、约束、索引、依赖、视图及程序定义 |
+| `query_dcs_data` | `sql/binds/previewRows` | Oracle SELECT/WITH，支持关联/聚合/CTE/窗口函数，完整结果分批写入JSON |
+| `search_dcs_knowledge` | `query` | 原知识检索保持不变 |
 
-- Core、Provider、模型、maxTurns、Context、RAG与登录链路未调整，未引入新依赖或运行框架。
-- 源码使用外部 **ripgrep**；需PATH安装`rg`，或设置`DCS_RG_PATH`。`execFile`传参，不执行模型Shell。find支持文件名/路径glob；search默认连续literal，多词或需regex，例如`宿舍|入住`。find/search的offset从0计，read从1计。
-- 保留目录/扩展名/真实路径限制；配置只发现文件名不读内容。凭据字面值隐藏，正常Token变量/签名保留。每文件2MiB、扫描10秒、候选15000、输出24000字符；截断/不完整显式标记。
-- Schema沿用服务端`DCS_DB_SCHEMA`或身份链路发现结果；否则唯一发现S2_EMPLOYEE的OWNER。不允许模型切换到其他Schema。真实外键按POSITION对齐；其他业务关系标unknown。元数据可见不代表业务数据授权。
-- 业务执行只接受固定参数化SELECT。岗位证书跨员工授权复用`AppMyMenu`专用代码`shanggangzhengchaxun`；宿舍复用`R_DataPermission`的DormAdmin厂区范围。请求者始终绑定会话，查询内再次包含范围条件；不继承特殊开发者绕过。岗位证书不是后台重点岗位管理列表。
-- Web测试仍需显式`DCS_ALLOW_WEB_TEST_IDENTITY=true`并重启；按输入工号模拟员工（生产必须关闭），测试开关不授予业务权限。CLI mock、角色名、自称管理员不能授权。
-- `list_available`返回目录和各查询参数Schema，不代表当前员工已获授权。状态区分`unsupported/denied/unverifiable/empty/success`以及连接/SQL/超时错误。自由SQL为`unsupported`，不执行；不得把工具缺能力说成DCS禁止业务。
-- 保留Oracle连接池、只读事务、finally回滚、20秒超时。查询支持offset/limit，最多返回100行；多取一行判断hasMore。`rowCount`是取回行数（含探测行），不是总命中数。JSONL记录参数化SQL、绑定值、行数、耗时与安全错误码，凭据脱敏。
-- **验证边界**：离线规则和回归已实现，真实Oracle返回NJS-530（主机解析失败），用户要求本次仅完成离线。真实业务数据/实际员工可见范围及真实模型行为未验证。未实现后台岗位完整列表、部门汇总、历史宿舍统计和管理地点报餐查询。
-- 完整Schema、查询示例、源码证据及测试结果见[Tool V2.1交付记录](docs/tool-v21-delivery.md)和[权限证据](docs/tool-v21-permissions.md)。旧V2交付文档仅作历史记录。
+- 移除任意Shell入口和分析脚本执行能力。源码根目录使用 `DCS_SOURCE_ROOT`（缺省Agent工作目录），真实路径必须在该目录内；搜索不跟随链接。rg由PATH或 `DCS_RG_PATH` 指定，禁用rg配置文件，模型只能传固定参数的值。
+- 搜索默认30条、最多100条，offset从0开始；固定按路径排序，contextLines默认2、最多5。上下文行也占分页条目，nextOffset用于继续同一搜索。单行预览最多1000字符，textTruncated时用源码读取工具查看。无匹配是empty；执行失败、取消和30秒超时单独返回。
+- 源码读取startLine从1开始，默认80行、最多200行，每个文件最多12000字符。长行使用startColumn（从0开始）续读；next=null才表示该文件范围已读完。批量读取中每个文件分别报告错误。
+- Schema参数与分页行为保留；数据库登记的约束和依赖不代表完整应用关系。大结果仍落盘，由read_dcs_result继续读取。
+- 数据库沿用现有账号配置和只读事务；单次调用超时20秒，Run取消调用connection.break。使用ResultSet每批256行读取并写文件；本次不更改真实数据库权限。
+- SQL预览默认50行、最多200行、16000字符。complete表示实际查询是否取完，previewTruncated仅表示预览缩短。部分失败文件标记complete=false；fetchedRows为已取得行数。
+- SQL文件结构为 `{columns,columnTypes,rows,fetchedRows,complete}`。NUMBER保留十进制字符串，日期ISO，二进制base64；错误保留Oracle诊断和可用的offset。
+- read_dcs_result只接受结果目录内的query/schema JSON文件。select如 `["rows"]` 或 `["objects",0,"columns",0,"TEXT"]`。数组/对象每页默认50、最多100条；字符串默认4000、最多16000字符。partial条目需用返回的select继续读取；hasMore仅表示当前值分页，sourceComplete表示原查询完整性。当前实现解析整个JSON文件后分页返回，不是流式JSON解析；大数据统计优先用SQL缩小结果。
+- 结果默认保存在 `data/tool-results/`，可用 `DCS_TOOL_OUTPUT_DIR` 指定。日志、会话及结果文件仍由后端写入，模型没有写文件能力；不新增结果存储或自动清理机制。
+- 功能说明无相关手册时继续查源码；先核对菜单/URL与页面接口对应关系，不按同名代码推定。导航unsupported只说明打开方式不支持。
 
 ## 7. 运行与测试
 
@@ -250,8 +264,8 @@ npm install                  # 安装依赖（typescript / tsx / @types/* / @wec
 npm run check                # 统一离线检查（typecheck + 全部离线测试，任一失败非零退出；不含真实模型/数据库测试）
 npm run typecheck            # tsc --noEmit
 npm test                     # 冒烟测试（FakeStreamFn + 假 DbClient，无需 key/真库）
-npm run test:accept          # 旧 Runtime 剧本 + 生产 Tool V2 离线验收
-npm run test:tools           # 生产工具边界、Fake Oracle/Model、临时源码回归
+npm run test:accept          # Runtime 剧本 + 只读源码/数据库工具离线验收
+npm run test:tools           # 真实rg/文件读取 + Fake Oracle/Model、分页与只读边界回归
 npm run test:cli             # CLI 展示层入口级验证（本地假模型）
 npm run test:wecom           # 企微 Channel 层测试（假动作/假 Agent/可控时钟）
 npm run test:web             # Web Channel 层测试（假身份+假 Agent，真实 HTTP）
@@ -281,7 +295,8 @@ npm run web                  # 网页端（需 LLM_API_KEY + DCS_DB_*）
 | `LLM_MODEL` | 否 | 默认 `Qwen3.5-35B` |
 | `WECOM_BOT_ID` | wecom:echo | 企业微信智能机器人 BotID（管理后台获取） |
 | `WECOM_BOT_SECRET` | wecom:echo | 智能机器人长连接专用 Secret（非 Token/EncodingAESKey） |
-| `DCS_SOURCE_ROOT` | investigate_dcs_code | DCS 源码根目录（指向本机 DCS 源码树，具体路径不入库）。**必须显式配置**，代码不硬编码；未配置时源码调查能力明确返回不可用 |
+| `DCS_SOURCE_ROOT` | 源码工具 | 允许读取的DCS源码根目录；未配置时使用Agent工作目录 |
+| `DCS_TOOL_OUTPUT_DIR` | 调查工具 | 完整结果与分析脚本目录，默认项目 data/tool-results |
 | `DCS_EMBEDDING_URL` / `DCS_EMBEDDING_API_KEY` | search_dcs_knowledge | 集团 Embedding 接口完整请求 URL + 凭据（两项齐备才启用知识库；URL 为完整地址，代码不追加路径）。未配置 → 工具返回能力不可用，systemPrompt 不注入知识库段，不影响其他工具 |
 | `DCS_EMBEDDING_MODEL` | 否 | 默认 `Qwen3-Embedding-8B`；更换模型需重建索引 |
 | `DCS_RERANK_URL` | 否 | 集团 Rerank 接口完整 URL（未配置时检索降级为向量排序并注明） |
@@ -371,7 +386,9 @@ npm run web   # http://localhost:8787
 
 ### 7.3 测试覆盖
 
-2026-10-14 Tool V2.1 当前验证见 [交付记录](docs/tool-v21-delivery.md)。下面带旧日期/数量的记录是历史快照；新工具替换了旧源码接口测试，旧自由 SQL 剧本改用测试专用 fixture，生产授权独立验证。
+2026-10-23：`npm run check` 全量离线检查通过，包含16项只读工具测试（真实rg及临时文件，Oracle/模型使用假实现）。真实DCS源码抽查成功定位两个AddressListController，并批量读取片段；一次测量中找文件1727ms、限定文件搜索52ms、批量读取5ms，不代表模型端到端性能。真实模型/数据库联调未执行。测试入口为 `npm run test:tools`。
+
+旧 Tool V2.1 验证记录见 [交付记录](docs/tool-v21-delivery.md)。下面带旧日期/数量的记录是历史快照；新工具替换了旧源码接口测试，旧自由 SQL 剧本改用测试专用 fixture。
 
 | 测试 | 结果 |
 |---|---|

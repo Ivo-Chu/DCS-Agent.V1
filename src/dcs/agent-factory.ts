@@ -38,7 +38,7 @@ export interface CreateDcsAgentOptions {
   streamFn?: StreamFn;
   /** 单 Run 最大轮数，默认 24（测试期宽松安全阀，非生产参数）。 */
   maxTurns?: number;
-  /** Channel 专用工具（如 Web 菜单导航）；不改变核心四个 Tool。 */
+  /** Channel 专用工具（如 Web 菜单导航）；不改变核心调查工具。 */
   extraTools?: ToolDefinition[];
 }
 
@@ -47,7 +47,7 @@ export const DEFAULT_MAX_TURNS = 32;
 export function createDcsAgent(opts: CreateDcsAgentOptions): Agent<DcsToolContext> {
   const { session, holder, streamFn, maxTurns = DEFAULT_MAX_TURNS } = opts;
   return new Agent<DcsToolContext>({
-    systemPrompt: buildSystemPrompt(session),
+    systemPrompt: buildSystemPrompt(session) + (session.user.source === "web" && opts.extraTools?.some(t => t.name === "navigate_dcs_menu") ? "\n【Web 页面导航规则】明确要求打开、进入、切换页面时，优先调用 navigate_dcs_menu，不强制先查知识库。询问操作方法、申请流程、制度说明时再按问题检索知识库。needs_selection 时界面已展示完整候选按钮，只需简短提示用户点击选择，不再列出候选路径，不猜选；只有工具实际返回 opened/switched 才能报告打开/切换成功。unsupported仅表示打开方式不支持，不能推断为管理员权限、后台同步或业务不可用。" : ""),
     tools: [...dcsTools, ...(opts.extraTools ?? [])],
     // signalProvider 每次模型调用求值：holder.controller 被 Channel 层替换后，
     // 下一轮模型请求立即使用新信号；被 abort 后旧 Run 无法再发起新请求

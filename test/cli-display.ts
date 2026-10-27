@@ -67,8 +67,8 @@ console.log("[场景] L. CLI 展示层（R3：后补文本显示 / R4：内部�
     answer.includes("暂时无法确认") && !answer.includes("Luxshare"), answer.slice(0, 200));
   // 工具开始提示收敛：observer 在工具开始时输出简洁提示（不等执行完）
   check(
-    "L4 工具开始时有简洁提示（▶ 工具调用 investigate_dcs_code）",
-    stderr.includes("▶ 工具调用") && stderr.includes("investigate_dcs_code"),
+    "L4 工具开始时有简洁提示（▶ 工具调用 search_dcs_code）",
+    stderr.includes("▶ 工具调用") && stderr.includes("search_dcs_code"),
     stdout.slice(0, 200)
   );
   check("L5 最终回复正常显示", stdout.includes("暂时无法确认"));

@@ -1,34 +1,19 @@
-/** 复用 DCS CheckSSOCode；只接受其实际成功返回契约。 */
-export async function checkSsoCodeWithDcs(
-  code: string,
-  checkUrl: string,
-  log: (msg: string) => void,
-  options: { signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<string | null> {
-  const configured = options.timeoutMs ?? Number(process.env.DCS_SSO_TIMEOUT_MS ?? 10000);
-  const timeoutMs = Number.isFinite(configured) && configured > 0 ? configured : 10000;
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  const timer = setTimeout(abort, timeoutMs);
-  options.signal?.addEventListener("abort", abort, { once: true });
-  if (options.signal?.aborted) abort();
-  try {
-    const res = await fetch(checkUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-      signal: controller.signal,
-    });
-    if (!res.ok) return null;
-    const body = await res.json() as { IsSuccess?: unknown; Data?: { EmpCode?: unknown } } | null;
-    return body?.IsSuccess === true && typeof body.Data?.EmpCode === "string" &&
-      /^[A-Za-z0-9_-]{1,64}$/.test(body.Data.EmpCode) ? body.Data.EmpCode : null;
-  } catch {
-    // 不把远端响应、code 或可能包含凭据的异常字符串写入日志。
-    log(controller.signal.aborted ? "[web] DCS SSO 校验超时或已取消" : "[web] DCS SSO 校验失败");
-    return null;
-  } finally {
-    clearTimeout(timer);
-    options.signal?.removeEventListener("abort", abort);
-  }
+export type LoginCheck = {status:"valid";employeeNo:string} | {status:"invalid"|"unavailable"};
+export interface LoginAuthority { verify(code:string, signal?:AbortSignal):Promise<LoginCheck>; }
+/** Reuse DCS WebApi Account/CheckSSOCode; no Session inspection or logout tracking. */
+export function createLoginAuthority(url=process.env.DCS_SSO_CHECK_URL ?? "http://localhost:19999/api/Account/CheckSSOCode", timeoutMs=Number(process.env.DCS_SSO_TIMEOUT_MS ?? 10000)):LoginAuthority {
+ return {async verify(code,signal){
+  const controller=new AbortController(),abort=()=>controller.abort();
+  const timer=setTimeout(abort,Number.isFinite(timeoutMs)&&timeoutMs>0?timeoutMs:10000);
+  signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();
+  try{
+   const response=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({Code:code}),signal:controller.signal});
+   if(!response.ok)return {status:"unavailable"};
+   const data=await response.json() as any;
+   if(data?.IsSuccess===false)return {status:"invalid"};
+   const employee=data?.Data?.EmpCode;
+   return data?.IsSuccess===true&&typeof employee==="string"&&/^[A-Za-z0-9_-]{1,64}$/.test(employee)?{status:"valid",employeeNo:employee.toUpperCase()}:{status:"unavailable"};
+  }catch{return {status:"unavailable"};}
+  finally{clearTimeout(timer);signal?.removeEventListener("abort",abort);}
+ }};
 }

@@ -14,7 +14,17 @@ export interface NavigateDcsMenuArgs {
   menuName?: string;
 }
 
-export interface NavigationResult { ok: boolean; message: string }
+export type NavigationStatus = "opened" | "switched" | "needs_selection" | "not_found" | "unsupported" | "failed";
+export interface NavigationResult { ok: boolean; message: string; status?: NavigationStatus; candidates?: {title:string;path:string}[] }
+export function parseNavigationResult(value:unknown):NavigationResult|null {
+  const v=value as NavigationResult|null;
+  if(!v||typeof v.ok!=="boolean"||typeof v.message!=="string"||!v.message.trim())return null;
+  const statuses=["opened","switched","needs_selection","not_found","unsupported","failed"];
+  if(v.status!==undefined&&!statuses.includes(v.status))return null;
+  if(v.status && v.ok!==["opened","switched"].includes(v.status))return null;
+  if(v.candidates!==undefined&&(!Array.isArray(v.candidates)||v.candidates.length>10||v.candidates.some(c=>!c||typeof c.title!=="string"||typeof c.path!=="string"||c.path.length>400)))return null;
+  return {ok:v.ok,message:v.message.slice(0,2000),...(v.status?{status:v.status}:{}),...(v.candidates?{candidates:v.candidates.map(c=>({title:c.title.slice(0,200),path:c.path}))}:{})};
+}
 export type RequestNavigation = (employeeNo: string, menuName: string) => Promise<NavigationResult>;
 
 const MENU_NAME_MAX = 400;
@@ -49,7 +59,7 @@ export function createNavigateDcsMenuTool(requestNavigation: RequestNavigation):
       }
       try {
         const result = await requestNavigation(employeeNo, menuName);
-        return { output: result.message, isError: !result.ok };
+        return { output: result.status ? JSON.stringify(result) : result.message, isError: !result.ok && result.status !== "needs_selection" };
       } catch (error) {
         return { output: `unavailable: 菜单导航暂时无法执行（${error instanceof Error ? error.message : String(error)}）。`, isError: true };
       }

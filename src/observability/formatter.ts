@@ -60,8 +60,14 @@ function toolFace(toolName: string): { icon: string; label: string } {
   switch (toolName) {
     case "query_dcs_data":
       return { icon: "🗄", label: "数据库查询" };
-    case "investigate_dcs_code":
-      return { icon: "🔍", label: "源码检索" };
+    case "exec_command":
+      return { icon: "🔍", label: "Shell调查" };
+    case "search_dcs_code":
+      return { icon: "🔍", label: "源码搜索" };
+    case "read_dcs_code":
+      return { icon: "📄", label: "源码读取" };
+    case "read_dcs_result":
+      return { icon: "📄", label: "查询结果读取" };
     case "search_dcs_knowledge":
       return { icon: "📚", label: "知识库检索" };
     default:

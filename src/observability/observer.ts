@@ -88,7 +88,7 @@ const DEFAULT_LOGS_DIR = path.resolve(
   "logs"
 );
 
-/** JSONL 单次结果文本落盘上限（超过明确标注截断与长度，禁止无提示丢失）。 */
+/** 终端单次结果文本展示上限（超过明确标注截断与长度，禁止无提示丢失）。 */
 const RESULT_TEXT_MAX = 8000;
 
 /**
@@ -116,7 +116,7 @@ function capped(text: string, max: number): { text: string; truncated: boolean; 
   return { text: `${text.slice(0, max)}…<已截断，共 ${fullLength} 字>`, truncated: true, fullLength };
 }
 
-/** JSONL 单条上下文消息上限（超过明确标注截断与长度）。 */
+/** 终端单条上下文消息上限（超过明确标注截断与长度）。 */
 const CONTEXT_MESSAGE_MAX = 8000;
 
 /**
@@ -124,11 +124,11 @@ const CONTEXT_MESSAGE_MAX = 8000;
  * 业务数据（员工工号/姓名/查询明细）保留，仅遮蔽凭据；单条超上限标注截断。
  */
 function redactContextMessages(
-  messages: ContextMessageSnapshot[]
+  messages: ContextMessageSnapshot[], max = CONTEXT_MESSAGE_MAX
 ): { messages: (ContextMessageSnapshot & { truncated?: boolean; fullLength?: number })[]; truncatedCount: number } {
   let truncatedCount = 0;
   const out = messages.map((m) => {
-    const c = capped(redactText(m.content), CONTEXT_MESSAGE_MAX);
+    const c = capped(redactText(m.content), max);
     if (c.truncated) truncatedCount++;
     return {
       ...m,
@@ -351,8 +351,9 @@ export function attachRunObserver(
             // 本轮实际发送给模型的完整上下文（凭据脱敏后的日志副本；
             // 快照在发射时固定，之后的运行时变化不影响本记录）
             systemPromptText: sysPrompt ?? null,
-            contextMessages: ctx?.messages ?? null,
-            contextTruncatedMessages: ctx?.truncatedCount ?? 0,
+            contextMessages: e.contextMessages ? redactContextMessages(e.contextMessages, Infinity).messages : null,
+            toolSchemas: e.toolSchemas ? redactValue(e.toolSchemas) : null,
+            contextTruncatedMessages: 0,
           });
           break;
         }
@@ -388,6 +389,7 @@ export function attachRunObserver(
             timestamp: new Date().toISOString(),
             runId: e.runId,
             event: "model_call_end",
+            output: e.output ? { content: redactText(e.output.content), toolCalls: e.output.toolCalls.map(tc => ({ ...tc, arguments: redactText(tc.arguments) })) } : null,
             turn: e.turn,
             durationMs: e.durationMs,
             stopReason: e.stopReason,
@@ -453,7 +455,7 @@ export function attachRunObserver(
           // 1. summary —— 原有消费者摘要（120 字，NORMAL 终端展示）；
           // 2. contextText —— 组装入上下文的完整结果（afterToolCall 处理后）；
           // 3. rawText —— 工具 execute 原始结果（处理前；相同时省略）。
-          // DEBUG/JSONL 使用脱敏后的完整文本（有上限，超限明确标注）。
+          // 终端展示可截断；JSONL 保存脱敏后的完整文本。
           const contextText = e.contextText ?? e.summary;
           const contextCapped = capped(redactText(contextText), RESULT_TEXT_MAX);
           const rawCapped = e.rawText !== undefined
@@ -500,12 +502,12 @@ export function attachRunObserver(
             chunkCount: e.details?.chunkCount ?? null,
             empty: e.details?.empty ?? null,
             note: e.note,
-            // 组装入上下文的完整结果（凭据脱敏后；超限标注截断与长度）
-            resultText: contextCapped.text,
-            resultTruncated: contextCapped.truncated,
+            // 组装入上下文的完整结果（凭据脱敏后，不做日志截断）
+            resultText: redactText(contextText),
+            resultTruncated: false,
             resultLength: contextCapped.fullLength,
             // 工具原始结果（仅当处理前后不同；相同标注一致不重复保存）
-            rawResult: rawCapped?.text ?? null,
+            rawResult: e.rawText !== undefined ? redactText(e.rawText) : null,
             resultChanged: rawCapped !== null,
             // 旧摘要字段保留（兼容原有消费者）
             resultSummary: redactText(e.summary),

@@ -1,0 +1,261 @@
+﻿@{
+    bool isHideLikeniu = ViewBag.IsHideLikeniu;
+    string agentUrl = System.Configuration.ConfigurationManager.AppSettings["DCSAgentUrl"];
+    if (string.IsNullOrWhiteSpace(agentUrl)) { agentUrl = "http://localhost:8787"; }
+}
+<style>
+    .layui-layer.dcs-agent-panel { top: 0 !important; left: auto !important; right: 0 !important; width: min(460px, calc(100vw - 16px)) !important; height: calc(100vh - 8px) !important; border-radius: 24px; background: transparent; box-shadow: none; }
+    .dcs-agent-panel .layui-layer-content { position: relative; z-index: 1; border-radius: inherit; overflow: hidden; }
+    .dcs-agent-panel .layui-layer-content, .dcs-agent-panel iframe { height: 100% !important; background: transparent; }
+
+    #likeniu {
+        position: fixed;
+        z-index: 99999999;
+        height: 80px;
+        width: 80px;
+        right: 30px;
+        bottom: 30px;
+    }
+
+        #likeniu .niulog {
+            position: absolute;
+            right: -14px;
+            top: -8px;
+            width: 20px;
+            height: 20px;
+        }
+
+        #likeniu .niushowhide {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+</style>
+<script src="~/Content/jquery.ui/jquery-ui-draggable.min.js"></script>
+<script src="@(agentUrl.TrimEnd('/') + "/assets/dcs-glass.js")"></script>
+<div id="likeniu">
+    <img class="niulog" src='https://dcsfile.luxshare-ict.com/Upload6/common/images/fangdasuoxiao.png'>
+    <a style="display:block; width:100%; height:100%;">
+        <img class="niushowhide" src="https://dcsfile.luxshare-ict.com/Upload6/common/images/likeniu.png" title="DCS Agent（单击打开）" />
+    </a>
+</div>
+<script>
+    $(function () {
+
+        @if(isHideLikeniu)
+        {
+            <text>$(".niushowhide").hide();</text>
+        }
+
+        // DCS Agent 前端地址由 Web.config 的 DCSAgentUrl 配置；未配置时使用本机调试地址。
+        var dcsAgentUrl = @Html.Raw(Json.Encode(agentUrl));
+        var dcsAgentOrigin = new URL(dcsAgentUrl).origin;
+        var dcsAgentLayerIndex = null;
+        var dcsAgentFrame = null;
+        var disposeAgentGlass = null;
+        var dcsAgentOpening = false;
+
+        function sendNavigationResult(sourceFrame, requestId, ok, message, status, candidates) {
+            if (!dcsAgentFrame || dcsAgentFrame !== sourceFrame) return;
+            try {
+                dcsAgentFrame.postMessage({
+                    type: "dcs_agent_navigate_result",
+                    requestId: requestId,
+                    ok: ok,
+                    message: message, status: status || (ok ? "opened" : "failed"), candidates: candidates
+                }, dcsAgentOrigin);
+            } catch (e) {
+                // iframe 已关闭或浏览器安全限制时不重试；Agent 后端有等待超时兜底。
+            }
+        }
+
+        function flattenAuthorizedMenus(nodes, result, parents) {
+            $.each(nodes || [], function (index, node) {
+                if (!node || typeof node.title !== "string") return;
+                var path = (parents || []).concat([node.title]);
+                result.push({
+                    title: node.title, path: path.join(" / "), href: node.href, target: node.target,
+                    directory: !!(node.child && node.child.length)
+                });
+                flattenAuthorizedMenus(node.child, result, path);
+            });
+        }
+
+        function normalizeMenuName(value) {
+            return typeof value === "string" ? $.trim(value).toLowerCase().replace(/\s*\/\s*/g, " / ") : "";
+        }
+
+        var activeNavigations = Object.create(null);
+        // 接收当前 iframe 的请求；已接收的导航继续执行，结果只回传原窗口。
+        window.addEventListener("message", function (event) {
+            if (event.origin !== dcsAgentOrigin || !dcsAgentFrame || event.source !== dcsAgentFrame) return;
+            var data = event.data;
+            if (!data) return;
+            if (data.type === "dcs_agent_close") {
+                if (dcsAgentLayerIndex !== null) layer.close(dcsAgentLayerIndex);
+                return;
+            }
+            if (typeof data.requestId !== "string") return;
+            if (data.type === "dcs_agent_reauthenticate") {
+                var authFrame = event.source;
+                $.ajax({ url: '@Url.Action("GetSSOCode", "Home", new { area = "" })', type: "POST", timeout: 10000 })
+                    .done(function (code) { if (authFrame === dcsAgentFrame) authFrame.postMessage({ type: "dcs_agent_auth_result", requestId: data.requestId, code: code }, dcsAgentOrigin); })
+                    .fail(function (xhr) { if (authFrame === dcsAgentFrame) authFrame.postMessage({ type: "dcs_agent_auth_result", requestId: data.requestId, status: xhr.status === 401 ? "invalid" : "unavailable" }, dcsAgentOrigin); });
+                return;
+            }
+            if (data.type !== "dcs_agent_navigate") return;
+            var requestId = data.requestId;
+            var menuName = typeof data.menuName === "string" ? $.trim(data.menuName) : "";
+            if (!requestId || requestId.length > 100 || !menuName || menuName.length > 400) {
+                sendNavigationResult(event.source, requestId, false, "导航请求格式无效。");
+                return;
+            }
+            if (activeNavigations[requestId]) return;
+            var sourceFrame = event.source, stopped = false, xhr;
+            var timer = setTimeout(function () { complete(false, "获取DCS菜单或页签模块超时。"); }, 30000);
+            function valid() { return !stopped; }
+            function cancel() {
+                if (stopped) return;
+                stopped = true;
+                clearTimeout(timer);
+                delete activeNavigations[requestId];
+                if (xhr) xhr.abort();
+            }
+            function complete(ok, message, status, candidates) {
+                if (!valid()) { cancel(); return; }
+                sendNavigationResult(sourceFrame, requestId, ok, message, status, candidates);
+                cancel();
+            }
+            activeNavigations[requestId] = { cancel: cancel };
+            xhr = $.get("@Url.Action("GetNewMenus", "Home", new { area = "" })", function (menuData) {
+                if (!valid()) { cancel(); return; }
+                var authorizedMenus = [];
+                flattenAuthorizedMenus(menuData && menuData.menuInfo, authorizedMenus, []);
+                var keyword = normalizeMenuName(menuName);
+                var matches = authorizedMenus.filter(function (item) {
+                    return normalizeMenuName(item.path) === keyword;
+                });
+                if (matches.length === 0) matches = authorizedMenus.filter(function (item) {
+                    return normalizeMenuName(item.title) === keyword;
+                });
+                if (matches.length === 0) {
+                    var words = keyword.replace(/^(请|帮我|请帮我)?(打开|进入|切换到?)\s*/, "").split(/\s+/).filter(Boolean);
+                    var candidates = authorizedMenus.filter(function (item) {
+                        return !item.directory && words.length && words.every(function (word) { return normalizeMenuName(item.path).indexOf(word) >= 0; });
+                    }).slice(0, 10).map(function (item) { return { title: item.title, path: item.path }; });
+                    complete(false, candidates.length ? "请选择完整菜单路径：" + candidates.map(function (c) { return c.path; }).join("、") : "未找到当前员工有权限访问的菜单：" + menuName,
+                        candidates.length ? "needs_selection" : "not_found", candidates); return;
+                }
+                if (matches.length > 1) {
+                    complete(false, "找到多个可选菜单，请指定完整路径：" +
+                        $.map(matches, function (item) { return item.path; }).join("、"), "needs_selection", matches.slice(0, 10).map(function (item) { return { title: item.title, path: item.path }; }));
+                    return;
+                }
+                var menu = matches[0];
+                var href = typeof menu.href === "string" ? $.trim(menu.href) : "";
+                var target = typeof menu.target === "string" ? menu.target.toLowerCase() : "";
+                var parsed;
+                try { parsed = new URL(href, window.location.href); } catch (e) { /* 拒绝非法地址 */ }
+                if (menu.directory || !href || href.charAt(0) === "#" ||
+                    (target && target !== "_self") || !parsed ||
+                    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+                    parsed.origin !== window.location.origin || parsed.username || parsed.password ||
+                    (parsed.pathname === window.location.pathname && parsed.search === window.location.search)) {
+                    complete(false, "不支持此菜单的打开方式，仅支持DCS内部页面页签：" + menu.path, "unsupported");
+                    return;
+                }
+                layui.use(["miniTab"], function () {
+                    if (!valid()) { cancel(); return; }
+                    try {
+                        var tabs = layui.miniTab;
+                        if (!tabs) throw new Error("页签模块尚未就绪");
+                        var existed = tabs.check(menu.href);
+                        if (!existed && tabs.create({
+                            tabId: menu.href, href: menu.href, title: menu.title,
+                            isIframe: false, maxTabNum: 50
+                        }) === false) {
+                            complete(false, "页签数量已达上限，请先关闭部分页签。");
+                            return;
+                        }
+                        if (!tabs.check(menu.href)) throw new Error("页签创建失败");
+                        tabs.change(menu.href);
+                        var activeId = $(".layuimini-tab .layui-tab-title li.layui-this").attr("lay-id");
+                        if (activeId !== menu.href) throw new Error("目标页签未激活");
+                        complete(true, (existed ? "已切换到：" : "已打开：") + menu.path, existed ? "switched" : "opened");
+                    } catch (e) {
+                        complete(false, "打开DCS菜单失败：" + (e && e.message ? e.message : String(e)));
+                    }
+                });
+            }).fail(function () { complete(false, "无法获取当前员工授权菜单。"); });
+        });
+
+        $(".niulog").click(function () {
+            $(".niushowhide").toggle();
+
+            $.post("@Url.Action("SaveDefaultLikeniuStatus")", { isHideLikeniu: $(".niushowhide").css("display") == "none" });
+        });
+
+        function openAgent() {
+            if (dcsAgentLayerIndex !== null || dcsAgentOpening) return;
+            dcsAgentOpening = true;
+            $.ajax({
+                url: '@Url.Action("GetSSOCode", "Home", new { area = "" })',
+                type: "POST", dataType: "json", timeout: 10000
+            }).done(function (code) {
+                dcsAgentOpening = false;
+                if (dcsAgentLayerIndex !== null) return;
+                var separator = dcsAgentUrl.indexOf("?") >= 0 ? "&" : "?";
+                var agentContent = dcsAgentUrl + separator + "_code=" + encodeURIComponent(code) + "&from=DCS";
+                $("#likeniu").fadeOut();
+                dcsAgentLayerIndex = layer.open({
+                    type: 2,
+                    shade: 0,
+                    title: false,
+                    closeBtn: 0,
+                    skin: "dcs-agent-panel",
+                    move: false,
+                    resize: false,
+                    offset: "rb",
+                    area: [Math.min(460, window.innerWidth - 16) + 'px', (window.innerHeight - 16) + 'px'],
+                    content: agentContent,
+                    success: function (layero, index) {
+                        dcsAgentLayerIndex = index;
+                        disposeAgentGlass = window.DcsAgentGlass.mount(layero[0]);
+                        var iframe = layero.find("iframe")[0];
+                        dcsAgentFrame = iframe ? iframe.contentWindow : null;
+                    },
+                    end: function () {
+                        if (disposeAgentGlass) { disposeAgentGlass(); disposeAgentGlass = null; }
+                        dcsAgentLayerIndex = null;
+                        dcsAgentFrame = null;
+                        dcsAgentOpening = false;
+                        $("#likeniu").fadeIn();
+                    }
+                });
+            }).fail(function (xhr, status) {
+                dcsAgentOpening = false;
+                var message = status === "timeout" ? "打开助手超时，DCS登录服务暂未响应，请稍后重试。" :
+                    xhr.status === 401 ? "DCS登录已失效，请重新登录后打开助手。" :
+                    xhr.status >= 500 ? "DCS登录服务异常，无法打开助手（HTTP " + xhr.status + "）。请检查DCS服务端错误。" :
+                    "无法获取助手登录凭据，请检查DCS连接与登录状态后重试。";
+                layer.msg(message, { icon: 2, time: 6000 });
+            });
+        }
+        $(".niushowhide").on("click", openAgent);
+        // 等 DCS 主框架完成加载后再自动打开，避免与启动请求争用 Session。
+        var dcsLoader = document.querySelector('.layuimini-loader');
+        if (dcsLoader && dcsLoader.style.display !== 'none') {
+            var loaderObserver = new MutationObserver(function () {
+                if (dcsLoader.style.display === 'none') {
+                    loaderObserver.disconnect();
+                    openAgent();
+                }
+            });
+            loaderObserver.observe(dcsLoader, { attributes: true, attributeFilter: ['style'] });
+        } else {
+            openAgent();
+        }
+
+        $('#likeniu').draggable();
+    })
+</script>

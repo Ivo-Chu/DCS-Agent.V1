@@ -104,7 +104,7 @@ async function main(): Promise<void> {
 
   const body = fetchCalls[0]?.body;
   check("F2a Qwen 模型、流式与关闭思考参数", body?.model === "Qwen3.5-35B" && body.stream === true && body.chat_template_kwargs?.enable_thinking === false);
-  check("F2b 四个工具与自动选择", body?.tool_choice === "auto" && body.tools?.length === 4 && ["investigate_dcs_code", "inspect_dcs_schema", "query_dcs_data", "search_dcs_knowledge"].every(name => body.tools.some((t: any) => t.function.name === name)));
+  check("F2b 六个工具与自动选择", body?.tool_choice === "auto" && body.tools?.length === 6 && ["search_dcs_code", "read_dcs_code", "read_dcs_result", "inspect_dcs_schema", "query_dcs_data", "search_dcs_knowledge"].every(name => body.tools.some((t: any) => t.function.name === name)));
   check("F2c 不添加采样参数", body && !("temperature" in body) && !("top_p" in body));
 
   // ---- F3：超时 abort → 模型调用失败，错误编码为最终回复（Run 不崩溃）----

@@ -1,3 +1,4 @@
+import { fixtureAuthority, conversationFetch as fetch } from "./web-conversation-fixture.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AddressInfo } from "node:net";
@@ -11,9 +12,9 @@ function deferred<T>() {
 }
 async function setup(prompt: (n: number, nav: RequestNavigation, emit: (e: AgentEvent) => void) => Promise<string>, budgetMs = 500) {
   let count = 0;
-  const server = createWebServer({
+  const server = createWebServer({ dataFile: ":memory:",
     budgetMs, navigationTimeoutMs: 200, logger: () => {},
-    checkSsoCode: async code => code,
+    authority: fixtureAuthority(async code => code),
     resolveIdentity: async code => ({ employeeNo: code, name: "Test" }),
     createAgent: (_id, _holder, _auth, nav): AgentLike => {
       const n = ++count;

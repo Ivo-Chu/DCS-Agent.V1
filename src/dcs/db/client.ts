@@ -5,7 +5,7 @@
  * - 真实实现：oracledb Thin 模式连接池（min 1 / max 2），惰性创建单例，
  *   每次 execute 设置 callTimeout=20s（防慢查询吃掉回复预算）；
  * - 环境变量门控：DCS_DB_USER / DCS_DB_PASSWORD / DCS_DB_CONNECT_STRING
- *   任一缺失 → 能力不可用（与 DCS_SOURCE_ROOT 模式一致）；
+ *   任一缺失 → 数据库能力不可用；
  * - 错误契约：execute 的 ORA 错误向上抛，由工具层捕获并转为文本返回
  *   （供模型自我修正 SQL），本模块不做吞错。
  */
@@ -15,10 +15,15 @@ export interface DbQueryResult {
   columns: string[];
   rows: unknown[][];
   truncated?: boolean;
+  columnTypes?: Array<{ name: string; type: string; precision?: number; scale?: number; nullable?: boolean }>;
 }
 
+export type DbBinds = Record<string, string | number | null>;
+
 export interface DbClient {
-  execute(sql: string, binds?: Record<string, string | number>): Promise<DbQueryResult>;
+  execute(sql: string, binds?: DbBinds): Promise<DbQueryResult>;
+  /** 分批读取完整查询；等待consume完成后才读取下一批。 */
+  stream?(sql: string, binds: DbBinds, consume: (batch: DbQueryResult) => Promise<void>, signal?: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -52,7 +57,7 @@ class OracleDbClient implements DbClient {
     return this.pool;
   }
 
-  async execute(sql: string, binds: Record<string, string | number> = {}): Promise<DbQueryResult> {
+  async execute(sql: string, binds: DbBinds = {}): Promise<DbQueryResult> {
     const pool = await this.getPool();
     const connection = await pool.getConnection();
     try {
@@ -69,6 +74,46 @@ class OracleDbClient implements DbClient {
       };
     } finally {
       try { await connection.rollback(); } finally { await connection.close(); }
+    }
+  }
+
+  async stream(sql: string, binds: DbBinds, consume: (batch: DbQueryResult) => Promise<void>, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const connection = await (await this.getPool()).getConnection();
+    let resultSet: oracledb.ResultSet<unknown[]> | undefined;
+    let breaking: Promise<void> | undefined;
+    const abort = () => { breaking ??= connection.break().catch(() => {}); };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      signal?.throwIfAborted();
+      connection.callTimeout = SQL_CALL_TIMEOUT_MS;
+      await connection.execute("SET TRANSACTION READ ONLY");
+      const result = await connection.execute<unknown[]>(sql, binds, {
+        resultSet: true, outFormat: oracledb.OUT_FORMAT_ARRAY, fetchArraySize: 256,
+        // NUMBER用十进制字符串保留金额/长ID精度；元数据仍记录Oracle类型。
+        fetchTypeHandler: metadata => {
+          if (metadata.dbType === oracledb.DB_TYPE_NUMBER || metadata.dbType === oracledb.DB_TYPE_CLOB || metadata.dbType === oracledb.DB_TYPE_NCLOB) return { type: oracledb.STRING };
+          if (metadata.dbType === oracledb.DB_TYPE_BLOB) return { type: oracledb.BUFFER };
+          return undefined;
+        },
+      });
+      resultSet = result.resultSet;
+      if (!resultSet) throw new Error("查询未返回结果集，请使用SELECT/WITH查询。");
+      const columnTypes = (result.metaData ?? []).map(m => ({ name: m.name, type: m.dbTypeName ?? String(m.dbType),
+        precision: m.precision, scale: m.scale, nullable: m.nullable }));
+      const columns = columnTypes.map(m => m.name);
+      while (true) {
+        signal?.throwIfAborted();
+        const rows = await resultSet.getRows(256);
+        signal?.throwIfAborted();
+        await consume({ columns, columnTypes, rows, truncated: false });
+        if (!rows.length) break;
+      }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      await breaking;
+      try { await resultSet?.close(); }
+      finally { try { await connection.rollback(); } finally { await connection.close(); } }
     }
   }
 

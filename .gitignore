@@ -17,3 +17,10 @@ test/acceptance-cases/reports/
 knowledge/documents/
 data/knowledge/
 .env.local
+
+# Login-scoped private conversation data
+data/web/
+*.sqlite-journal
+
+# Shell输出和SQL完整查询结果（本地分析文件）
+data/tool-results/

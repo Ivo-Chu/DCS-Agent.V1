@@ -29,7 +29,7 @@ globalThis.fetch = async () => {
     // args 模式
     body =
       i === 0
-        ? tool("investigate_dcs_code", { operation: "search", pattern: "Luxshare.DCS.WebApi/Controllers/ReviewProbe.cs" })
+        ? tool("search_dcs_code", { mode: "files", pattern: "*ReviewProbe*" })
         : text("暂时无法确认，请联系管理员。");
   }
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });

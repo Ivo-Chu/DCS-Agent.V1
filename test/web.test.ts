@@ -1,8 +1,9 @@
+import { fixtureAuthority, conversationFetch as fetch } from "./web-conversation-fixture.ts";
 /**
  * Web Channel 层确定性测试。
  * 注入假身份解析与假 Agent，不依赖 LLM / Oracle / 真实身份数据；
  * 通过真实 HTTP（随机端口）验证静态页、建档、鉴权、SSE 流式问答、
- * busy 拒绝、reset 丢弃实例，以及 Run 日志闭环（正常/超时/断开恰一次落盘）。
+ * busy 拒绝、新建对话 丢弃实例，以及 Run 日志闭环（正常/超时/断开恰一次落盘）。
  *
  * 运行：npm run test:web
  */
@@ -144,7 +145,7 @@ async function readSse(resp: Response): Promise<SseEvent[]> {
 let createAgentCalls = 0;
 let agentImpl: ((q: string, emit: (e: AgentEvent) => void) => Promise<string>) | undefined;
 
-const server = createWebServer({
+const server = createWebServer({ dataFile: ":memory:",
   resolveIdentity: async (code) => (code === "10086" ? TEST_IDENTITY : null),
   createAgent: () => {
     createAgentCalls++;
@@ -179,7 +180,7 @@ let token = "";
     body: JSON.stringify({ code: "99999" }),
   });
   const data = (await resp.json()) as { ok: boolean };
-  check("未知工号建档被拒（404 + ok:false）", resp.status === 404 && data.ok === false);
+  check("未知工号建档被拒（403 + ok:false）", resp.status === 403 && data.ok === false);
 }
 
 {
@@ -277,7 +278,7 @@ section("W4. busy 拒绝并发");
     return "慢回答";
   };
   // 新会话触发新 Agent 实例（携带慢实现）
-  await fetch(`${base}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  await fetch(`${base}/api/conversations`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
 
   const first = fetch(`${base}/api/chat`, {
     method: "POST",
@@ -308,19 +309,19 @@ section("W4. busy 拒绝并发");
 }
 
 // ---------------------------------------------------------------------------
-// 场景 W5：reset 丢弃 Agent 实例
+// 场景 W5：新建对话使用独立 Agent 实例
 // ---------------------------------------------------------------------------
 
-section("W5. reset 与新实例");
+section("W5. 新建对话 与新实例");
 
 {
   const before = createAgentCalls;
-  const resp = await fetch(`${base}/api/reset`, {
+  const resp = await fetch(`${base}/api/conversations`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = (await resp.json()) as { ok: boolean };
-  check("reset 返回 ok:true", resp.status === 200 && data.ok);
+  check("新建对话 返回 ok:true", resp.status === 201 && data.ok);
 
   const chatResp = await fetch(`${base}/api/chat`, {
     method: "POST",
@@ -328,14 +329,14 @@ section("W5. reset 与新实例");
     body: JSON.stringify({ question: "新会话第一问" }),
   });
   await readSse(chatResp);
-  check("reset 后再次提问创建了新的 Agent 实例", createAgentCalls === before + 1, `calls=${createAgentCalls}`);
+  check("新建对话 后再次提问创建了新的 Agent 实例", createAgentCalls === before + 1, `calls=${createAgentCalls}`);
 }
 
 // ---------------------------------------------------------------------------
-// 场景 W6：处理中 reset 竞争（409 拒绝 + 不创建第二个 Agent + 完成后可重置）
+// 场景 W6：处理中允许新建对话，但仍只运行一个回复
 // ---------------------------------------------------------------------------
 
-section("W6. 处理中 reset 竞争修复");
+section("W6. 处理中新建会话与单回复限制");
 
 {
   const releaser: { fn?: () => void } = {};
@@ -345,8 +346,8 @@ section("W6. 处理中 reset 竞争修复");
     });
     return "慢回答";
   };
-  // 空闲状态先重置，确保从干净实例开始
-  await fetch(`${base}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  // 空闲状态先新建，确保从干净实例开始
+  await fetch(`${base}/api/conversations`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
 
   const first = fetch(`${base}/api/chat`, {
     method: "POST",
@@ -355,44 +356,44 @@ section("W6. 处理中 reset 竞争修复");
   });
   await sleep(50); // 等第一个 Run 占住 busy
 
-  // 处理中 reset → 409
-  const resetResp = await fetch(`${base}/api/reset`, {
+  // 处理中允许新建对话
+  const createResp = await fetch(`${base}/api/conversations`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
-  const resetData = (await resetResp.json()) as { ok: boolean; message?: string };
+  const createData = (await createResp.json()) as { ok: boolean; message?: string };
   check(
-    "W6a 处理中 reset 被拒绝（409 + ok:false + 提示语）",
-    resetResp.status === 409 && resetData.ok === false && (resetData.message ?? "").includes("正在处理中"),
-    `status=${resetResp.status} body=${JSON.stringify(resetData)}`
+    "W6a 处理中允许新建对话（201 + ok:true）",
+    createResp.status === 201 && createData.ok === true,
+    `status=${createResp.status} body=${JSON.stringify(createData)}`
   );
 
-  // 409 之后实例保留：随后提问应收到 busy（同一个 Agent，不创建第二个）
+  // 新建后原实例继续运行：新会话提问仍收到 busy，不创建第二个 Agent
   const before = createAgentCalls;
   const duringBusy = await fetch(`${base}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ question: "被拒后的插队问题" }),
+    body: JSON.stringify({ question: "新会话的插队问题" }),
   });
   const busyEvents = await readSse(duringBusy);
   check(
-    "W6b 拒绝重置后实例与 busy 状态保留（再次提问收到 busy，未创建第二个 Agent）",
+    "W6b 新建会话后原实例与 busy 状态保留（再次提问收到 busy，未创建第二个 Agent）",
     busyEvents.some((e) => e.type === "busy") && createAgentCalls === before,
     `busy=${String(busyEvents.some((e) => e.type === "busy"))} agents=${createAgentCalls - before}`
   );
 
-  // 原请求完成后 → reset 成功 → 新实例创建
+  // 原请求完成后 → 新建对话 成功 → 新实例创建
   releaser.fn?.();
   const firstResp = await first;
   const firstEvents = await readSse(firstResp);
   check("W6c 原慢请求正常完成（final 到达，busy 解除）", firstEvents.some((e) => e.type === "final" && e.text === "慢回答"));
 
-  const reset2 = await fetch(`${base}/api/reset`, {
+  const create2 = await fetch(`${base}/api/conversations`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
-  const reset2Data = (await reset2.json()) as { ok: boolean };
-  check("W6d 原请求完成后 reset 成功（200 + ok:true）", reset2.status === 200 && reset2Data.ok === true);
+  const create2Data = (await create2.json()) as { ok: boolean };
+  check("W6d 原请求完成后 新建对话 成功（201 + ok:true）", create2.status === 201 && create2Data.ok === true);
 
   agentImpl = undefined;
   const newChat = await fetch(`${base}/api/chat`, {
@@ -414,7 +415,7 @@ section("W7. 超时清理不误删新实例（discardEntryIfCurrent）");
   // 慢 Agent：每次 prompt 挂起直到测试手动 resolve；迟到 resolve 后无任何输出
   let w7AgentCalls = 0;
   const resolvers: Array<() => void> = [];
-  const server7 = createWebServer({
+  const server7 = createWebServer({ dataFile: ":memory:",
     resolveIdentity: async (code) => (code === "10086" ? TEST_IDENTITY : null),
     createAgent: () => {
       w7AgentCalls++;
@@ -478,7 +479,7 @@ section("W8. Run 日志闭环（正常 / 超时 / 断开：恰一次 run_end 且
 function readAllJsonl(logsDir: string): Map<string, Record<string, unknown>[]> {
   const out = new Map<string, Record<string, unknown>[]>();
   if (!fs.existsSync(logsDir)) return out;
-  for (const f of fs.readdirSync(logsDir).filter((n) => n.endsWith(".jsonl"))) {
+  for (const f of fs.readdirSync(logsDir, { recursive: true }).map(String).filter((n) => n.endsWith(".jsonl"))) {
     const records = fs.readFileSync(path.join(logsDir, f), "utf8")
       .trim()
       .split("\n")
@@ -501,23 +502,13 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
 
 {
   const w8LogsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dcs-web-logs-"));
-  let logsFlushedResolver: (() => void) | null = null;
-  let logsFlushed: Promise<void> = Promise.resolve();
-  const armFlushWait = (): void => {
-    logsFlushed = new Promise<void>((r) => {
-      logsFlushedResolver = r;
-    });
-  };
-  const w8Server = createWebServer({
+  const w8Server = createWebServer({ dataFile: ":memory:",
     resolveIdentity: async (code) => (code === "10086" ? TEST_IDENTITY : null),
     createAgent: () => new FakeAgent(agentImpl),
     budgetMs: 150,
     staticDir: fileURLToPath(new URL("../../DCS Agent.web", import.meta.url)),
     logger: () => undefined,
     logsDir: w8LogsDir,
-    awaitLogs: async () => {
-      logsFlushedResolver?.();
-    },
   });
   await new Promise<void>((resolve) => w8Server.listen(0, resolve));
   const base8 = `http://127.0.0.1:${(w8Server.address() as AddressInfo).port}`;
@@ -562,10 +553,9 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
   // ---- W8-2 超时路径：end("timeout") 记录准确原因且恰好一次 ----
   {
     const filesBefore = readAllJsonl(w8LogsDir).size;
-    armFlushWait();
     // 挂起 Agent：永不 resolve，必然触发预算超时
     agentImpl = async () => new Promise<string>(() => undefined);
-    await fetch(`${base8}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
+    await fetch(`${base8}/api/conversations`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
     const resp = await fetch(`${base8}/api/chat`, {
       method: "POST",
       headers: headers8,
@@ -574,8 +564,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
     const events = await readSse(resp);
     check("W8-2 超时路径 SSE 收到 timeout（业务行为不变）",
       events.some((e) => e.type === "timeout"));
-    // 等待 flush 完成（awaitLogs 钩子在 observer.end("timeout") 后触发）
-    await Promise.race([logsFlushed, sleep(2000)]);
+    // 直接检查 JSONL 中的结束记录。
     const ok = await waitFor(() => {
       const all = readAllJsonl(w8LogsDir);
       if (all.size <= filesBefore) return false;
@@ -597,9 +586,8 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
 
   // ---- W8-3 客户端断开路径：end("disconnected") 恰好一次 ----
   {
-    armFlushWait();
     agentImpl = async () => new Promise<string>(() => undefined); // 挂起
-    await fetch(`${base8}/api/reset`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
+    await fetch(`${base8}/api/conversations`, { method: "POST", headers: { Authorization: `Bearer ${token8}` } });
     const controller = new AbortController();
     const pending = fetch(`${base8}/api/chat`, {
       method: "POST",
@@ -610,7 +598,6 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
     await sleep(80); // 确保请求已建立、Run 已开始
     controller.abort();
     await pending;
-    await Promise.race([logsFlushed, sleep(2000)]);
     const ok = await waitFor(() => {
       for (const records of readAllJsonl(w8LogsDir).values()) {
         if (records.some((r) => r.event === "run_end" && r.reason === "disconnected")) return true;

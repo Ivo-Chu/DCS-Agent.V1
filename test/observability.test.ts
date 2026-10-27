@@ -685,8 +685,8 @@ section("O12. 凭据分支、未完成调用及真实 Provider 元数据回归")
     const observer = attachRunObserver(emitter, { channel: "test", level, logsDir, write: t => { output += t; } });
     const runId = `credential-${level}`;
     emitter.emit({ type: "run_start", runId, startedAt: new Date().toISOString() });
-    emitter.emit({ type: "tool_execution_start", runId, turn: 1, step: 1, toolCallId: "c", toolName: "investigate_dcs_code", args: { query: "password=SYNTH_QUERY", ...nested } });
-    emitter.emit({ type: "tool_execution_end", runId, turn: 1, step: 1, toolCallId: "c", toolName: "investigate_dcs_code", durationMs: 1, isError: true, summary: "token=SYNTH_RESULT", contextText: "Authorization: Bearer SYNTH_RESULT", rawText: 'password="SYNTH RAW"' });
+    emitter.emit({ type: "tool_execution_start", runId, turn: 1, step: 1, toolCallId: "c", toolName: "exec_command", args: { query: "password=SYNTH_QUERY", ...nested } });
+    emitter.emit({ type: "tool_execution_end", runId, turn: 1, step: 1, toolCallId: "c", toolName: "exec_command", durationMs: 1, isError: true, summary: "token=SYNTH_RESULT", contextText: "Authorization: Bearer SYNTH_RESULT", rawText: 'password="SYNTH RAW"' });
     await observer.end("detached");
     check(`O12-3 ${level} 终端和 JSONL 所有已测输出分支均无凭据`,
       !output.includes("SYNTH") && !JSON.stringify(readJsonl(logsDir).records).includes("SYNTH"));

@@ -13,7 +13,7 @@
  *   isError=false，并核对结果摘要中的关键证据（权限/角色、报餐/订单、餐标）
  * - 业务答案核对具体事实（42 / 35 / 超出 / 驳回——离线剧本数据），
  *   允许等价表述
- * - investigate_dcs_code 为允许的辅助调查工具，不作硬性要求
+ * - 源码与结果读取为允许的辅助调查工具，不作硬性要求
  *
  * 【live 注意】acceptance-live.ts 共用本判定器：场景 2/3 的事实核对
  * （42/35/驳回）基于离线剧本数据；真实库 + 真实身份前，live 场景可能
@@ -62,7 +62,7 @@ function commonFailures(qe: QEvents): string[] {
 }
 
 /** 允许的工具：数据库查询（必需）与源码调查（辅助）。 */
-const ALLOWED_TOOLS = new Set(["query_dcs_data", "investigate_dcs_code"]);
+const ALLOWED_TOOLS = new Set(["query_dcs_data", "search_dcs_code", "read_dcs_code", "read_dcs_result", "inspect_dcs_schema"]);
 
 function disallowedTools(qe: QEvents): string[] {
   return qe.toolStarts

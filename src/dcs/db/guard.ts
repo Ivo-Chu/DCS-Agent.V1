@@ -1,8 +1,7 @@
 /**
  * dcs/db/guard.ts — SQL 稳定性护栏（纯函数，方案 query-dcs-data-plan-v1 §5）。
  *
- * 文本预检查，不是 SQL 解析器或授权边界。生产 query_dcs_data 不执行自由 SQL；
- * 由 authorization.ts 的可信身份及固定参数化查询决定可执行内容。
+ * 查询语句预检查，不是SQL解析器。数据库继续使用只读事务。
  * - 仅允许 SELECT / WITH 开头；
  * - 单语句（含注释中藏分号的检测）；
  * - 拒绝 FOR UPDATE 锁定。
@@ -15,11 +14,21 @@ export interface SqlGuardResult {
 
 /** 去掉行注释 / 块注释 / 首尾空白与结尾分号，返回用于校验的语句体。 */
 function stripForCheck(sql: string): string {
-  return sql
-    .replace(/--[^\n]*/g, " ")
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .trim()
-    .replace(/;+\s*$/, "");
+  // 字符串、带引号标识符和注释中的关键字/分号不属于SQL操作。
+  let out = "", i = 0;
+  while (i < sql.length) {
+    if (sql.startsWith("--", i)) { const end = sql.indexOf("\n", i); i = end < 0 ? sql.length : end; out += " "; }
+    else if (sql.startsWith("/*", i)) { const end = sql.indexOf("*/", i + 2); i = end < 0 ? sql.length : end + 2; out += " "; }
+    else if ((sql[i] === "q" || sql[i] === "Q") && sql[i + 1] === "'") {
+      const open = sql[i + 2], close = ({ "[": "]", "(": ")", "{": "}", "<": ">" } as Record<string, string>)[open] ?? open;
+      const end = sql.indexOf(`${close}'`, i + 3); i = end < 0 ? sql.length : end + 2; out += " value ";
+    } else if (sql[i] === "'" || sql[i] === '"') {
+      const quote = sql[i++];
+      while (i < sql.length) { if (sql[i++] === quote) { if (sql[i] === quote) i++; else break; } }
+      out += " value ";
+    } else out += sql[i++];
+  }
+  return out.trim().replace(/;\s*$/, "");
 }
 
 export function guardSql(sql: string): SqlGuardResult {
@@ -38,7 +47,7 @@ export function guardSql(sql: string): SqlGuardResult {
     return { ok: false, reason: "不允许锁定语句（FOR UPDATE）。" };
   }
   if (/\b(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke|execute|begin|declare|function|procedure)\b/i.test(body)) {
-    return { ok: false, reason: "不接受写入、过程或内嵌 PL/SQL；此预检查不代表查询已获授权。" };
+    return { ok: false, reason: "本工具执行查询，不接受写入、过程调用或内嵌 PL/SQL。" };
   }
   return { ok: true };
 }

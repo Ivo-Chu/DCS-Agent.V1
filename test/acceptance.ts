@@ -6,7 +6,7 @@
  * 不证明真实模型行为。真实模型三问验收见 test/acceptance-live.ts。
  *
  * 【2026-09-24 Mock 工具移除】场景载体统一为 query_dcs_data：
- * DcsSession / systemPrompt / DCS Hooks 为真实实现，查询工具为 Runtime 专用 fixture；生产授权验收见 tools-v2.test.ts。
+ * DcsSession / systemPrompt / DCS Hooks 为真实实现，查询工具为 Runtime 专用 fixture；生产工具验收见 tools-readonly.test.ts。
  * 数据库为注入的假 DbClient（按 SQL 关键词返回剧本化数据，
  * 不连真库；真实库行为由 test/live-db.ts 验证）。
  * 剧本中的回复内容与假库 ToolResult 的数据保持一致（不引入剧本外信息）。

@@ -1,4 +1,4 @@
-/** 仅供旧 Runtime 剧本验证分发/消息/错误恢复，不证明生产数据授权。生产工具见 tools-v2.test.ts。 */
+/** 仅供旧 Runtime 剧本验证分发/消息/错误恢复，不证明真实数据库查询质量。生产工具见 tools-readonly.test.ts。 */
 import { dcsTools } from "../src/dcs/tools.ts";
 import { getDbClient } from "../src/dcs/db/client.ts";
 import { guardSql } from "../src/dcs/db/guard.ts";

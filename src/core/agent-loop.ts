@@ -100,6 +100,7 @@ export async function runAgentLoop<C>(
     // ---- 1. 调用模型（StreamFn 契约：永不 reject；此处再兜一层）----
     const turnNo = turn + 1;
     const messageCount = workingMessages.length;
+    const toolSchemas = config.tools.map(toToolSchema);
     config.emit({
       type: "model_call_start",
       runId: config.runId,
@@ -107,7 +108,8 @@ export async function runAgentLoop<C>(
       messageCount,
       messageCountDelta: prevMessageCount === null ? messageCount : messageCount - prevMessageCount,
       hasSystemPrompt: config.systemPrompt.length > 0,
-      toolSchemaCount: config.tools.length,
+      toolSchemaCount: toolSchemas.length,
+      toolSchemas,
       // 观测快照：本轮实际传给模型的 System Prompt 与完整上下文消息。
       // 浅拷贝——之后运行时对 workingMessages 的 push 不影响已发射快照；
       // 消息内容来自运行时本身，不产生额外模型调用或工具执行。
@@ -128,7 +130,7 @@ export async function runAgentLoop<C>(
       for await (const ev of config.streamFn({
         systemPrompt: config.systemPrompt,
         messages: workingMessages,
-        tools: config.tools.map(toToolSchema),
+        tools: toolSchemas,
       })) {
         switch (ev.type) {
           case "text_delta":
@@ -175,6 +177,7 @@ export async function runAgentLoop<C>(
         durationMs: modelDurationMs,
         stopReason: "error",
         toolCallCount: 0,
+        output: { content: text, toolCalls },
         usage,
         errorMessage,
         finishReason,
@@ -225,6 +228,7 @@ export async function runAgentLoop<C>(
       durationMs: modelDurationMs,
       stopReason,
       toolCallCount: effectiveToolCalls.length,
+      output: { content: text, toolCalls },
       usage,
       errorMessage,
       finishReason,

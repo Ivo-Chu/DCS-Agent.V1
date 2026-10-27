@@ -8,7 +8,7 @@
  * 新事件的唯一消费者是 observability 层（终端日志 + JSONL），不产生额外
  * 模型调用或工具执行。
  */
-import type { AssistantMessage, TokenUsage, ToolExecutionDetails } from "./types.ts";
+import type { AssistantMessage, TokenUsage, ToolExecutionDetails, ToolSchema } from "./types.ts";
 
 /**
  * 上下文消息快照（observability 专用，model_call_start 携带）。
@@ -55,6 +55,7 @@ export type AgentEvent =
       hasSystemPrompt: boolean;
       /** 本轮提供的 Tool Schema 数量。 */
       toolSchemaCount: number;
+      toolSchemas?: ToolSchema[];
       /**
        * 可选观测字段：本轮实际传给模型的 System Prompt 文本。
        * 仅用于开发者日志（DEBUG 终端 / JSONL）；不含凭据。
@@ -77,6 +78,7 @@ export type AgentEvent =
       stopReason: AssistantMessage["stopReason"];
       /** 本轮产生的 Tool Call 数量。 */
       toolCallCount: number;
+      output?: { content: string; toolCalls: { id: string; name: string; arguments: string }[] };
       /** Provider 返回的真实 Token 用量（未提供则缺省，不得估算）。 */
       usage?: TokenUsage;
       /** stopReason 为 "error" 时的错误说明。 */

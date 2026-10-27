@@ -1,3 +1,4 @@
+import { fixtureAuthority, conversationFetch as fetch } from "./web-conversation-fixture.ts";
 import { requireTrustedEmployee } from "../src/dcs/db/authorization.ts";
 import { createNavigateDcsMenuTool } from "../src/dcs/navigation-tool.ts";
 import type { DcsToolContext } from "../src/dcs/session.ts";
@@ -32,9 +33,9 @@ class NoopAgent implements AgentLike {
   async prompt(): Promise<string> { return "ok"; }
 }
 delete process.env.DCS_ALLOW_WEB_TEST_IDENTITY;
-const navServer = createWebServer({
+const navServer = createWebServer({ dataFile: ":memory:",
   resolveIdentity: async (code) => code === "10086" ? { employeeNo: "10086", name: "张三", department: "制造一部", roles: [] } : null,
-  checkSsoCode: async (code) => code === "sso-ok" ? "10086" : null,
+  authority: fixtureAuthority(async (code) => code === "sso-ok" ? "10086" : null),
   createAgent: () => new NoopAgent(),
   logger: () => undefined,
   navigationTimeoutMs: 100,

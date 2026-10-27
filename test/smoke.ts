@@ -364,7 +364,7 @@ section("D. beforeToolCall 阻断扩展点（core 契约，v1 未启用业务逻
 }
 
 // ---------------------------------------------------------------------------
-// 源码工具测试已迁移至 tools-v2.test.ts（新接口及安全边界）。
+// 源码工具测试已迁移至 tools-readonly.test.ts（源码读取、数据库和结果文件）。
 
 // 场景 F：runAgentLoop 直接调用 —— 边界与不可变性
 // ---------------------------------------------------------------------------
@@ -799,7 +799,7 @@ async function runThreeQuestions(plans: TurnPlan[]): Promise<{ qes: QEvents[]; r
 // 场景 L：query_dcs_data（query-dcs-data-plan-v1：假 DbClient，无需真库）
 // ---------------------------------------------------------------------------
 
-section("L. Runtime 假工具/查询格式化（生产授权见 tools-v2）（护栏 / 格式化 / 错误透传 / 门控 / 脱敏链路）");
+section("L. Runtime 假工具/查询格式化（生产工具见 tools-readonly）（护栏 / 格式化 / 错误透传 / 门控 / 脱敏链路）");
 
 {
   // makeFakeClient 已提升至文件顶部（与场景 A/B/G/K 共享）；

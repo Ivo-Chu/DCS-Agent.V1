@@ -1,0 +1,13 @@
+/* Only the fixed window and composer use optical filters; scrolling messages stay in normal flow. */
+.dcs-liquid-surface { position:absolute; inset:0; pointer-events:none; border-radius:inherit; }
+.dcs-liquid-surface > .pointer-events-none { pointer-events:none; opacity:0; }
+.dcs-liquid-optics > .glass { width:100%; height:100%; box-sizing:border-box; box-shadow:0 12px 36px rgba(64,112,198,.16), inset 0 0 0 1px rgba(255,255,255,.72) !important; }
+.dcs-liquid-optics > svg { pointer-events:none; }
+.dcs-liquid-optics, .dcs-liquid-optics > .glass, .dcs-liquid-surface > span { transition:none !important; }
+.dcs-liquid-optics > .glass::after { content:""; position:absolute; inset:0; border-radius:inherit; background:linear-gradient(160deg,rgba(223,235,250,.65),rgba(250,253,255,.8)); box-shadow:inset 0 2px 5px rgba(57,86,128,.14), inset 0 -1px 0 rgba(255,255,255,.95); pointer-events:none; }
+/* Frost the actual DCS document before rdev samples it, outside the iframe and SVG filter. */
+.dcs-agent-liquid-host { -webkit-backdrop-filter:blur(18px) saturate(135%); backdrop-filter:blur(18px) saturate(135%); background:rgba(245,249,255,.62); }
+.dcs-agent-liquid-host .glass::after { background:rgba(248,251,255,.16); box-shadow:none; }
+
+/* Restrict optical distortion to the bevel; the broad center stays evenly frosted. */
+.dcs-liquid-surface .glass__warp { box-sizing:border-box; padding:2px; opacity:.18; -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite:exclude; }

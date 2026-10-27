@@ -1,67 +1,79 @@
-import type { ToolDefinition, ToolOutput } from "../core/types.ts";
+import type { ToolDefinition } from "../core/types.ts";
 import type { DcsToolContext } from "./session.ts";
-import { getDbClient, type DbClient } from "./db/client.ts";
-import { requireTrustedEmployee, resolveSchema } from "./db/authorization.ts";
+import { getDbClient, type DbBinds, type DbQueryResult } from "./db/client.ts";
 import { databaseError, failure } from "./db/result.ts";
-import { queryCatalog, validateParams, executeBusinessQuery, type Params } from "./db/queries/catalog.ts";
-import { maskPii } from "./hooks.ts";
+import { guardSql } from "./db/guard.ts";
+import { createArtifact } from "./artifacts.ts";
 
-export interface QueryDcsDataArgs { query?: string; params?: Params; sql?: string }
+export interface QueryDcsDataArgs { sql: string; binds?: DbBinds; previewRows?: number }
+export function serializeDbValue(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (Buffer.isBuffer(value)) return { encoding: "base64", value: value.toString("base64") };
+  if (typeof value === "bigint") return value.toString();
+  return value;
+}
 export const queryDcsDataTool: ToolDefinition<QueryDcsDataArgs, DcsToolContext> = {
-  name: "query_dcs_data", label: "DCS授权数据查询",
-  description: "用list_available发现固定业务查询及参数。本人和授权他人均可查询，由程序绑定请求者并验证真实业务规则。菜单不等于数据范围。unsupported是工具未覆盖，denied是明确无授权，unverifiable是无法验权，empty仅表示当前查询条件无记录。自由SQL不执行；元数据使用inspect_dcs_schema。",
+  name: "query_dcs_data", label: "DCS SQL查询",
+  description: "执行Oracle SELECT/WITH查询，支持JOIN、CTE、聚合、窗口函数和命名绑定变量。未知对象先查inspect_dcs_schema或源码，使用已确认的schema限定表名。返回少量预览及完整JSON结果文件resultFile，可用read_dcs_result分页读取。complete表示已取完结果；previewTruncated仅表示预览缩短。NUMBER为十进制字符串，日期ISO，二进制base64。空结果不等于错误；错误返回Oracle诊断供修正。",
   parameters: { type: "object", additionalProperties: false, properties: {
-    query: { type: "string", enum: ["list_available", ...queryCatalog.map(q => q.name)] },
-    params: { type: "object", description: "业务参数由list_available返回的各查询Schema定义；不能指定请求者或SQL。" },
-    sql: { type: "string", description: "旧参数只返回unsupported，不执行。" },
-  }, oneOf: [{ required: ["query"] }, { required: ["sql"] }] },
+    sql: { type: "string", minLength: 1 },
+    binds: { type: "object", additionalProperties: { type: ["string", "number", "null"] }, description: "命名绑定变量（SQL中:name，键为name）。日期绑定ISO文本并在SQL显式TO_DATE/TO_TIMESTAMP。" },
+    previewRows: { type: "integer", minimum: 0, maximum: 200, default: 50 },
+  }, required: ["sql"] },
   async execute(args, ctx) {
-    if (!args || Object.keys(args).some(k => !["query", "params", "sql"].includes(k)) ||
-      (args.query === undefined) === (args.sql === undefined) ||
-      (args.query !== undefined && typeof args.query !== "string") ||
-      (args.sql !== undefined && (typeof args.sql !== "string" || !args.sql.trim())) ||
-      (args.params !== undefined && (!args.params || typeof args.params !== "object" || Array.isArray(args.params)))) return failure("invalid_args", "请指定query和params；请求者身份来自会话。");
-    if (args.sql !== undefined) return failure("unsupported", "自由SQL未实现受控授权，不执行；使用list_available发现已支持查询。这不代表DCS禁止该业务。");
-    const name = args.query!;
-    const p = args.params ?? {};
-    if (name === "list_available") return Object.keys(p).length ? failure("invalid_args", "list_available不接受参数。") :
-      { output: JSON.stringify({ status: "success", queries: queryCatalog, message: "这是工具能力目录，不是当前员工已获授权清单；执行时验权。" }) };
-    if (!queryCatalog.some(q => q.name === name)) return failure("unsupported", "工具尚未覆盖此业务查询；可继续调查源码/操作文档，不能据此判定用户无权限。");
-    const invalid = validateParams(name, p);
-    if (invalid) return failure("invalid_args", invalid);
-    const databaseQueries: Array<Record<string, unknown>> = [];
-    const traced = (output: ToolOutput): ToolOutput => ({ ...output, details: { ...output.details, ...{ databaseQueries } } });
+    if (!args || typeof args.sql !== "string" || Object.keys(args).some(k => !["sql", "binds", "previewRows"].includes(k))) return failure("invalid_args", "需要sql，可选binds、previewRows。");
+    const previewRows = args.previewRows ?? 50, binds = args.binds ?? {};
+    if (!Number.isInteger(previewRows) || previewRows < 0 || previewRows > 200 || !binds || typeof binds !== "object" || Array.isArray(binds) ||
+      Object.values(binds).some(v => v !== null && typeof v !== "string" && !(typeof v === "number" && Number.isFinite(v)))) return failure("invalid_args", "previewRows范围0–200；binds值只能是字符串、有限数值或null。");
+    const guard = guardSql(args.sql);
+    if (!guard.ok) return failure("invalid_args", guard.reason!);
+    const sql = args.sql.trim().replace(/;\s*$/, "");
+    const db = getDbClient();
+    if (!db) return failure("unavailable", "数据库未配置（DCS_DB_USER/DCS_DB_PASSWORD/DCS_DB_CONNECT_STRING）。");
+    const signal = ctx.holder?.controller.signal, started = Date.now();
+    let resultFile: string | null = null, fetchedRows = 0, complete = false, previewChars = 0, previewTruncated = false;
+    let columns: string[] = [], columnTypes: DbQueryResult["columnTypes"] = [], rows: unknown[][] = [];
+    let artifact: Awaited<ReturnType<typeof createArtifact>> | undefined;
+    let opened = false;
+    const writeBatch = async (batch: DbQueryResult) => {
+      signal?.throwIfAborted();
+      if (!opened) {
+        columns = batch.columns; columnTypes = batch.columnTypes ?? [];
+        await artifact!.handle.writeFile(`{"columns":${JSON.stringify(columns)},"columnTypes":${JSON.stringify(columnTypes)},"rows":[`);
+        opened = true;
+      }
+      for (const row of batch.rows) {
+        const values = row.map(serializeDbValue), json = JSON.stringify(values);
+        await artifact!.handle.writeFile(`${fetchedRows ? "," : ""}${json}`);
+        fetchedRows++;
+        if (rows.length < previewRows && previewChars + json.length <= 16000 && !previewTruncated) {
+          rows.push(values); previewChars += json.length;
+        } else previewTruncated = true;
+      }
+    };
+    let error: unknown;
     try {
-      const actor = requireTrustedEmployee(ctx), client = getDbClient();
-      if (!client) return failure("unavailable", "数据库未配置。");
-      const db: DbClient = { close: () => client.close(), async execute(sql, binds) {
-        const start = Date.now();
-        const trace: Record<string, unknown> = { sql, binds };
-        databaseQueries.push(trace);
-        try { const r = await client.execute(sql, binds); trace.rowCount = r.rows.length; trace.status = "success"; return r; }
-        catch (error) { trace.status = "error"; trace.code = /(?:ORA|NJS|DPI)-\d+/.exec(String(error))?.[0]; throw error; }
-        finally { trace.durationMs = Date.now() - start; }
-      } };
-      const owner = await resolveSchema(db);
-      const execution = await executeBusinessQuery(name, p, db, owner, actor);
-      const auth = execution.authorization;
-      if (auth.status !== "authorized") return traced(failure(auth.status, auth.message, auth.code));
-      const result = execution.result!, limit = Number(p.limit ?? 100), offset = Number(p.offset ?? 0);
-      let contentTruncated = false;
-      const rows = result.rows.slice(0, limit).map(row => row.map(value => {
-        if (value === null || typeof value === "number" || typeof value === "boolean") return value;
-        const text = maskPii(value instanceof Date ? value.toISOString() : String(value));
-        if (text.length > 200) contentTruncated = true;
-        return text.slice(0, 200);
-      }));
-      while (JSON.stringify(rows).length > 50000) { rows.pop(); contentTruncated = true; }
-      const hasMore = Boolean(result.truncated || result.rows.length > rows.length);
-      const truncated = hasMore || contentTruncated;
-      return traced({ output: JSON.stringify({ status: result.rows.length ? "success" : "empty", query: name,
-        authorization: auth, filters: execution.filters, columns: result.columns, rows,
-        rowCount: result.rows.length, rowCountMeaning: "本次取回行数（含分页探测行），不是总命中数", returnedRowCount: rows.length,
-        offset, hasMore, nextOffset: hasMore ? offset + rows.length : null, truncated, contentTruncated }),
-        details: { rowCount: result.rows.length, columns: result.columns, truncated, empty: !result.rows.length } });
-    } catch (error) { return traced(databaseError(error)); }
+      signal?.throwIfAborted();
+      artifact = await createArtifact("query", "json"); resultFile = artifact.filename;
+      if (db.stream) { await db.stream(sql, binds, writeBatch, signal); complete = true; }
+      else { const r = await db.execute(sql, binds); await writeBatch(r); complete = !r.truncated; }
+      signal?.throwIfAborted();
+    } catch (e) { error = e; complete = false; }
+    finally {
+      if (artifact) {
+        try {
+          if (!opened) await artifact.handle.writeFile('{"columns":[],"columnTypes":[],"rows":[');
+          await artifact.handle.writeFile(`],"fetchedRows":${fetchedRows},"complete":${complete}}`);
+        } catch (e) { error = e; complete = false; resultFile = null; }
+        finally { await artifact.handle.close(); }
+      }
+    }
+    const data = { columns, columnTypes, rows, fetchedRows, complete, previewTruncated, resultFile, durationMs: Date.now() - started };
+    if (error !== undefined) {
+      const failureResult = signal?.aborted ? failure("cancelled", "查询已取消，文件中可能只有部分结果。") : databaseError(error);
+      return { ...failureResult, output: JSON.stringify({ ...JSON.parse(failureResult.output), ...data }) };
+    }
+    return { output: JSON.stringify({ status: fetchedRows ? "success" : "empty", ...data }),
+      details: { rowCount: fetchedRows, columns, truncated: !complete || previewTruncated, empty: fetchedRows === 0 } };
   },
 };

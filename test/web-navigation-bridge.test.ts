@@ -1,3 +1,4 @@
+import { fixtureAuthority, conversationFetch as fetch } from "./web-conversation-fixture.ts";
 import type { DcsIdentity } from "../src/dcs/identity.ts";
 import { createNavigateDcsMenuTool, type RequestNavigation } from "../src/dcs/navigation-tool.ts";
 import type { DcsToolContext } from "../src/dcs/session.ts";
@@ -29,9 +30,9 @@ function createIdentity(employeeNo: string): DcsIdentity {
 }
 
 async function startServer(navigationTimeoutMs: number) {
-  const server = createWebServer({
+  const server = createWebServer({ dataFile: ":memory:",
     resolveIdentity: async (code) => code === "10086" || code === "20001" ? createIdentity(code) : null,
-    checkSsoCode: async (code) => code.startsWith("sso-") ? code.slice(4) : null,
+    authority: fixtureAuthority(async (code) => code.startsWith("sso-") ? code.slice(4) : null),
     createAgent: (_identity, _holder, _auth, requestNavigation) => new NavigationAgent(requestNavigation),
     logger: () => undefined,
     navigationTimeoutMs,

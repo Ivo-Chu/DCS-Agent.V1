@@ -164,7 +164,7 @@ async function main(): Promise<void> {
   check("K1a getKnowledgeConfig() 未配置返回 null", getKnowledgeConfig() === null);
   const k1 = await searchDcsKnowledgeTool.execute({ query: "怎么报餐" }, ctxWithHolder());
   check("K1b 未配置 → 能力不可用 isError:true 且提示 DCS_EMBEDDING_*", k1.isError === true && k1.output.includes("DCS_EMBEDDING_URL"), k1.output);
-  check("K1c 其他工具仍在注册列表", dcsTools.some((t) => t.name === "query_dcs_data") && dcsTools.some((t) => t.name === "investigate_dcs_code"));
+  check("K1c 其他工具仍在注册列表", dcsTools.some((t) => t.name === "query_dcs_data") && dcsTools.some((t) => t.name === "search_dcs_code"));
   check("K1d 未配置时 systemPrompt 不注入知识库段", !buildSystemPrompt(createMockSession()).includes("search_dcs_knowledge"));
 
   // ================= K2 分块规则 =================
