@@ -524,7 +524,7 @@ async function main(): Promise<void> {
   section("K10. 注册与提示词");
   check("K10a search_dcs_knowledge 已注册", dcsTools.some((t) => t.name === "search_dcs_knowledge"));
   const p = buildSystemPrompt(createMockSession());
-  check("K10b 已配置时 systemPrompt 含知识库段与出处格式", p.includes("search_dcs_knowledge") && p.includes("依据：《报餐操作手册》"));
+  check("K10b 已配置时 systemPrompt 含知识库段与出处要求", p.includes("search_dcs_knowledge") && p.includes("依据知识库文档作答时，附简洁出处"));
   check("K10c CHUNKING_VERSION 存在（索引元数据用）", typeof CHUNKING_VERSION === "number");
 
   console.log(`\n========== 知识库工具测试结果 ==========`);

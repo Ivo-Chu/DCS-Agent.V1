@@ -6,6 +6,20 @@
 
 ---
 
+## Harness V1 候选原型（2026-10-28，尚未生产验收）
+
+- 保留现有单 Agent / AgentLoop、Qwen Provider、工具注册与 JSONL 观测链路。生产 `prompt.ts` 未修改；按需调查 Prompt 仅在 `test/harness-v1-live.ts` 的 C 配置中替换。
+- `search_dcs_code` 增加 `mode: "feature"`，仅接受 `pattern/offset/limit`；业务入口未找到或失效时可继续使用原有 `files/text`。结果仅提供线索，需 `read_dcs_code` 核实业务实现。
+- 本地地图默认 `data/harness-v1/source-map.json`，可由 `DCS_SOURCE_MAP_FILE` 指定。整个 `data/harness-v1/` 已忽略，不提交公司映射、标准事实及报告。字段结构为 `version: 1, entries: [{ name, aliases, page, controller, action, verification: { status, basis, checkedAt }, references: [{ path, startLine, endLine, sha256, role }] }]`。`role` 为 route/controller/view/implementation；必须具备前三种依据，所有引用复用既有路径边界检查，验证行号和文件全文 SHA-256。不自动生成“已验证”状态；登记前须核实路由、控制器和视图关系，哈希检查不能替代语义核实。
+- 第一版本地地图覆盖通讯录、重点/一般岗位、宿舍床位统计（宿舍管理的一个子功能）。仅确认当前静态源码的页面关系，未确认线上部署、菜单或员工权限。地图不含标准答案；评测事实另存 `cases.json`，只供评测端使用。
+- 参数错误返回 `status/field/actual/allowed/example`。仅文本搜索的非负整数 `contextLines > 5` 自动取 5，在结果 `corrections` 中记录原值和新值；其他字段不自动改写。结果新增 `kind: source/resource/other`、分页单位及解释，仍保留所有真实搜索结果、匹配行、上下文与续读位置。资源类型标注不是相关性排序。
+- 离线验证：`npm run test:harness:v1`（合成数据、真实 rg/文件系统）已纳入 `npm run check`。完整 check 已通过。同步修正了既有知识库测试依赖过期 Prompt 示例的断言，未修改生产 Prompt。
+- 真实模型对比入口：`npm run test:harness:v1:live`。需先准备本地 `baseline/source-tools.ts`（固定原始工具）、`baseline/prompt.txt`、`source-map.json` 和 `cases.json`（至少三个领域，含 question/expectedFacts/evidence）。本机准备及固定记录保存在忽略目录；入口复用 `acceptance-harness.ts` 的结果分类/报告及现有 JSONL observer。A=原始工具/Prompt，B=参数与结果改进（不暴露 feature），C=B+feature+按需调查 Prompt。每题独立三次，轮换配置次序；固定模型、轮数与 120 秒预算，记录源码引用全文、地图、用例、工具和 Prompt 校验信息。
+- 实验为**源码隔离评测**：使用模拟身份，非源码工具统一返回不可用，不解析真实员工身份、不查询生产库。它不是完整线上 Agent 业务验收。标准答案不进入模型消息，业务正确率、定位准确率、错误恢复和无依据事实数留给逐 Trace 审核；不能用正常完成或工具命中代替成功。2026-10-28 经用户授权已完成 27 次真实 Qwen3.5 隔离运行（3领域 × A/B/C × 3次），源码引用校验保持一致；逐源码/Trace初评三组业务通过均为0/9，人工标准事实及业务签字仍待确认。目前不建议合并生产或扩大模块覆盖。
+- 当前可复查结果：本地 `data/harness-v1/offline-results.json`、`check.log`、`baseline/manifest.json`。直接重放三次 `contextLines:20` 输入，原始工具均报参数错误，候选均成功；四个业务入口均通过文件、行号及哈希校验。这是工具层验证，不能折算成模型业务成功率。原有 24 次通讯录运行仅作故障材料，不计为 24 道题。
+- 真实实验结果（本机报告 `data/harness-v1/runs/2026-10-28T01-24-23-947Z/source-review.json`，27份Trace同目录）：A/B/C正常结束分别3/9、3/9、9/9；超时6、6、0；模型调用15、15、9；工具调用10、19、0；平均耗时110.0、111.5、91.0秒。三组均未调用read_dcs_code；C从未使用feature。A有1次返回全部目标文件路径，B有部分定位但无完整命中；路径命中不代表业务证据充分。参数错误及contextLines自动修正均未触发，不能声称错误率或恢复改善。首轮模型响应耗时中位90.4秒，120秒预算显著限制多轮调查；本实验不能单独归因于工具或Prompt。无依据业务主张按去重主张组初评标注11/13/37组，虚构调查过程3/6/7项，逐项内容可在报告复核。A/B各6次调用缺失usage，仅报告已知小计，不估算完整Token。
+- 实践参考：[Harness engineering](https://openai.com/index/harness-engineering/) 的渐进式上下文与可读环境，以及 [Agent improvement loop](https://developers.openai.com/cookbook/examples/agents_sdk/agent_improvement_loop) 的固定用例、Trace、评估闭环；未引入其 SDK 或多 Agent 运行时。
+
 ## 本机日志查看页（2026-10-23）
 
 - Agent Web 根地址直接打开显示日志页；DCS iframe 内仍显示原聊天界面，不更改 DCS 接入地址。

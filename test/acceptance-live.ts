@@ -25,6 +25,7 @@ import { createDcsAgent, type DcsAgentHolder } from "../src/dcs/agent-factory.ts
 import { resolveEmployeeByCode } from "../src/dcs/identity.ts";
 import { createSession } from "../src/dcs/session.ts";
 import { closeDbClient } from "../src/dcs/db/client.ts";
+import { attachRunObserver } from "../src/observability/observer.ts";
 import {
   classifyRun,
   ConversationRegistry,
@@ -35,8 +36,8 @@ import {
   type HarnessAgent,
 } from "./acceptance-harness.ts";
 
-const CASES_FILE = path.resolve(import.meta.dirname, "acceptance-cases", "cases.json");
-const REPORTS_DIR = path.resolve(import.meta.dirname, "acceptance-cases", "reports");
+const CASES_FILE = process.env.ACCEPT_CASES_FILE ?? path.resolve(import.meta.dirname, "acceptance-cases", "cases.json");
+const REPORTS_DIR = process.env.ACCEPT_REPORTS_DIR ?? path.resolve(import.meta.dirname, "acceptance-cases", "reports");
 /** 本轮总超时：避免验收脚本无限挂起（10 分钟）。 */
 const TOTAL_BUDGET_MS = 10 * 60 * 1000;
 
@@ -162,7 +163,11 @@ async function runCase(
   holder.controller = new AbortController();
 
   const events: AgentEvent[] = [];
-  const unsubscribe = conv.slot.agent.subscribe((e) => events.push(e));
+  const observer = attachRunObserver(conv.slot.agent, { channel: "acceptance-live", logsDir: process.env.ACCEPT_LOGS_DIR, write: null });
+  const unsubscribe = conv.slot.agent.subscribe((e) => {
+    events.push(e);
+    if (e.type === "run_start") console.log(JSON.stringify({ caseId: c.id, runId: e.runId }));
+  });
   const startedAt = Date.now();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -177,6 +182,8 @@ async function runCase(
     return classifyRun(c, { answer: "", events, timedOut, durationMs: Date.now() - startedAt, error: err });
   } finally {
     clearTimeout(timer);
+    await observer.end(timedOut ? "timeout" : "detached");
+    observer.detach();
     unsubscribe();
   }
 }

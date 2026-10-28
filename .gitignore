@@ -24,3 +24,6 @@ data/web/
 
 # Shell输出和SQL完整查询结果（本地分析文件）
 data/tool-results/
+
+# 本地业务入口、固定基线及隔离实验（包含内部源码映射）
+data/harness-v1/
