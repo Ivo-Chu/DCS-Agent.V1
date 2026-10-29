@@ -39,6 +39,7 @@ export type AgentEvent =
       model?: string;
       /** 可选观测元数据：模型服务提供方标识（不含凭据与服务地址）。 */
       provider?: string;
+      policyState?: Record<string, unknown>;
     }
   | { type: "message_delta"; text: string }
   | { type: "assistant_message"; message: AssistantMessage }
@@ -56,6 +57,8 @@ export type AgentEvent =
       /** 本轮提供的 Tool Schema 数量。 */
       toolSchemaCount: number;
       toolSchemas?: ToolSchema[];
+      toolChoice?: "auto" | "required";
+      policyState?: Record<string, unknown>;
       /**
        * 可选观测字段：本轮实际传给模型的 System Prompt 文本。
        * 仅用于开发者日志（DEBUG 终端 / JSONL）；不含凭据。
@@ -79,6 +82,8 @@ export type AgentEvent =
       /** 本轮产生的 Tool Call 数量。 */
       toolCallCount: number;
       output?: { content: string; toolCalls: { id: string; name: string; arguments: string }[] };
+      draftDisposition?: "discarded" | "accepted";
+      policyState?: Record<string, unknown>;
       /** Provider 返回的真实 Token 用量（未提供则缺省，不得估算）。 */
       usage?: TokenUsage;
       /** stopReason 为 "error" 时的错误说明。 */
@@ -133,7 +138,7 @@ export type AgentEvent =
       /** Run 结束（所有路径均保证发射：正常 / maxTurns / 模型失败 / 异常）。 */
       type: "run_end";
       runId: string;
-      status: "completed" | "failed";
+      status: "completed" | "failed" | "awaiting_input";
       /**
        * 结束原因：
        * completed      模型自然停止（stop/length）
@@ -141,10 +146,12 @@ export type AgentEvent =
        * model_error    模型接口失败
        * unexpected     其他异常（防御性兜底）
        */
-      reason: "completed" | "max_turns" | "model_error" | "unexpected";
+      reason: "completed" | "max_turns" | "model_error" | "unexpected" | "awaiting_input";
       elapsedMs: number;
       modelCalls: number;
       toolCalls: number;
+      completionReason?: string;
+      policyState?: Record<string, unknown>;
     };
 
 export type AgentEventFn = (e: AgentEvent) => void;

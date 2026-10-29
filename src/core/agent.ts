@@ -25,9 +25,12 @@ import type {
   ToolDefinition,
   ToolHooks,
   UserMessage,
+  RunPolicy,
 } from "./types.ts";
 
 const DEFAULT_MAX_TURNS = 8;
+
+export interface AgentPromptOptions { requestContext?: Record<string, unknown> }
 
 export interface AgentOptions<C = unknown> {
   systemPrompt: string;
@@ -42,6 +45,9 @@ export interface AgentOptions<C = unknown> {
    * 文件名另含时间戳；并发 Run 冲突概率可忽略）。
    */
   runIdFactory?: () => string;
+  prepareRun?: (text: string, history: readonly AgentMessage[], requestContext?: Record<string, unknown>) =>
+    { text: string; policy?: RunPolicy } | Promise<{ text: string; policy?: RunPolicy }>;
+  signalProvider?: () => AbortSignal;
 }
 
 export class Agent<C = unknown> {
@@ -59,7 +65,10 @@ export class Agent<C = unknown> {
     return this.emitter.subscribe(fn);
   }
 
-  async prompt(text: string): Promise<string> {
+  async prompt(text: string, options: AgentPromptOptions = {}): Promise<string> {
+    const prepared = await this.opts.prepareRun?.(text, this.context, options.requestContext);
+    text = prepared?.text ?? text;
+    const policy = prepared?.policy;
     const userMessage: UserMessage = { role: "user", content: text };
     this.emitter.emit({ type: "agent_start", prompt: text });
 
@@ -72,17 +81,20 @@ export class Agent<C = unknown> {
       startedAt: new Date(startedAt).toISOString(),
       model: modelInfo?.model,
       provider: modelInfo?.provider,
+      policyState: policy?.snapshot?.(),
     });
 
     const config: AgentLoopConfig<C> = {
       runId,
-      systemPrompt: this.opts.systemPrompt,
+      systemPrompt: this.opts.systemPrompt + (policy?.systemPromptSuffix ?? ""),
       tools: this.opts.tools,
       streamFn: this.opts.streamFn,
       hooks: this.opts.hooks,
       toolContext: this.opts.toolContext,
       maxTurns: this.opts.maxTurns ?? DEFAULT_MAX_TURNS,
       emit: (e) => this.emitter.emit(e),
+      policy,
+      signal: this.opts.signalProvider?.(),
     };
 
     let result;
@@ -110,15 +122,17 @@ export class Agent<C = unknown> {
     // 结束原因：maxTurns 耗尽 / 模型失败 / 正常完成
     const lastAssistant = [...newMessages].reverse().find((m) => m.role === "assistant");
     const stopReason = lastAssistant?.role === "assistant" ? lastAssistant.stopReason : undefined;
-    const reason = endedByMaxTurns ? "max_turns" : stopReason === "error" ? "model_error" : "completed";
+    const reason = endedByMaxTurns ? "max_turns" : stopReason === "error" ? "model_error" : result.completionReason === "awaiting_input" ? "awaiting_input" : "completed";
     this.emitter.emit({
       type: "run_end",
       runId,
-      status: reason === "completed" ? "completed" : "failed",
+      status: reason === "completed" ? "completed" : reason === "awaiting_input" ? "awaiting_input" : "failed",
       reason,
       elapsedMs: Date.now() - startedAt,
       modelCalls,
       toolCalls,
+      completionReason: result.completionReason,
+      policyState: policy?.snapshot?.(),
     });
     this.emitter.emit({ type: "agent_end", finalText });
     return finalText;

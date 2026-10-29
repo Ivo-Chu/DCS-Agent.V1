@@ -115,6 +115,19 @@ export interface ToolHooks<C = unknown> {
   ): string;
 }
 
+export type ToolChoice = "auto" | "required";
+export interface RunFinish { text: string; reason: string }
+/** 单次 Run 的调用/结束扩展点；业务状态由调用方创建，不存入 Agent。 */
+export interface RunPolicy {
+  bufferText?: boolean;
+  systemPromptSuffix?: string;
+  prepareTurn?(turn: number): { toolNames?: string[]; toolChoice?: ToolChoice; finish?: RunFinish };
+  onToolResult?(call: ToolCall, result: ToolResultMessage): void;
+  checkFinish?(info: { turn: number; remainingTurns: number }): { retry: string } | { finish: RunFinish } | undefined;
+  afterTools?(): RunFinish | undefined;
+  snapshot?(): Record<string, unknown>;
+}
+
 /** 模型流式事件（StreamFn 的产出）。 */
 export type ModelStreamEvent =
   | { type: "text_delta"; text: string }
@@ -156,6 +169,7 @@ export type StreamFn = ((req: {
   systemPrompt: string;
   messages: AgentMessage[];
   tools: ToolSchema[];
+  toolChoice?: ToolChoice;
 }) => AsyncGenerator<ModelStreamEvent>) & {
   /** Provider 创建时确定的观测信息；自定义实现未提供时保持未知。 */
   readonly observability?: Readonly<{ model: string; provider: string }>;

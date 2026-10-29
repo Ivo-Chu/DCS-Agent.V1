@@ -7,6 +7,8 @@ import { loadEnvLocal } from '../src/dcs/env-local.ts';
 import { createOpenAiStreamFn } from '../src/core/model/openai-compatible.ts';
 import { Agent } from '../src/core/agent.ts';
 import type { StreamFn, ToolDefinition } from '../src/core/types.ts';
+import { dcsTools } from '../src/dcs/tools.ts';
+import { createNavigateDcsMenuTool } from '../src/dcs/navigation-tool.ts';
 
 loadEnvLocal();
 const endpoint = `${process.env.LLM_BASE_URL?.replace(/\/+$/, '')}/chat/completions`;
@@ -103,7 +105,15 @@ const body=await serialize(basic);
 const mode=process.argv[2]??'matrix';
 await fs.writeFile(path.join(out,'manifest.json'),JSON.stringify({mode,startedAt:new Date().toISOString(),endpoint,model:process.env.LLM_MODEL,productionHashes:before,productionSerializedRequest:body,timeoutMs:150000,note:'Only synthetic lookup executes. Raw request bodies omit Authorization header. No production Tool, identity or database calls.'},null,2));
 console.log(JSON.stringify({out,mode}));
-if(mode==='matrix') {
+if(mode==='schema-required'||mode==='schema-required-original') {
+ const tools=[...dcsTools,createNavigateDcsMenuTool(async()=>{throw new Error('Must not execute navigation');})];
+ const original=JSON.stringify(tools.map(t=>t.parameters));
+ const request=await serialize({systemPrompt:'这是隔离的工具选择测试。只生成工具调用，不编造查询结果。',messages:[{role:'user',content:'请使用 inspect_dcs_schema 搜索名称包含 SYNTHETIC_SCHEMA_PROBE 的表结构。'}],tools});
+ if(mode==='schema-required-original')request.tools.forEach((t:any,i:number)=>{t.function.parameters=tools[i].parameters;});
+ for(let repeat=1;repeat<=(mode==='schema-required-original'?1:2);repeat++)await measure(`r${repeat}-full-tools-required`,{...request,tool_choice:'required'});
+ if(original!==JSON.stringify(tools.map(t=>t.parameters)))throw new Error('Original schemas mutated');
+ await fs.writeFile(path.join(out,'schema-audit.json'),JSON.stringify({tools:tools.map(t=>({name:t.name,parameters:t.parameters})),originalSchemasUnchanged:true},null,2));
+} else if(mode==='matrix') {
  const conditions=[['auto',true],['required',true],['forced',true],['auto',false],['required',false],['forced',false]] as const;
  for(let repeat=1;repeat<=2;repeat++)for(const [choice,stream] of repeat===1?conditions:[...conditions].reverse()){
   const request={...body,stream,tool_choice:choice==='forced'?{type:'function',function:{name:'lookup'}}:choice};

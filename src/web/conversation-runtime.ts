@@ -5,6 +5,7 @@ import { rm, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent } from "../core/events.ts";
 import type { AgentMessage } from "../core/types.ts";
+import type { AgentPromptOptions } from "../core/agent.ts";
 import { attachRunObserver } from "../observability/observer.ts";
 import type { DcsIdentity } from "../dcs/identity.ts";
 import type { NavigationResult, RequestNavigation } from "../dcs/navigation-tool.ts";
@@ -16,7 +17,7 @@ export interface WebSession {
 }
 export interface AgentLike {
     context?: AgentMessage[];
-    prompt(question: string): Promise<string>;
+    prompt(question: string, options?: AgentPromptOptions): Promise<string>;
     subscribe(fn: (e: AgentEvent) => void): () => void;
 }
 export type AgentFactory = (identity: DcsIdentity, holder: {
@@ -128,7 +129,7 @@ export class ConversationRuntime {
         }
     }
     async close() { await Promise.all([...this.runs.values()].map(r => r.stop("服务关闭，本次回复已中断。"))); }
-    async chat(session: WebSession, c: Conversation, question: string, res: ServerResponse) {
+    async chat(session: WebSession, c: Conversation, question: string, res: ServerResponse, pageContext?: { title?: string; path?: string }) {
         res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" });
         if (this.busy(session.identity.employeeNo)) {
             sse(res, { type: "busy", message: "上一问正在处理中，请先停止当前回复。" });
@@ -171,7 +172,7 @@ export class ConversationRuntime {
         this.runs.set(session.identity.employeeNo, r);
         // Content exists only in scope-owned logs; no chat text in the global console.
         const observer = attachRunObserver(entry.agent, { channel: "Web", logsDir: this.logDir(session.agentSessionId, c.id) });
-        let messageId = "1", failed = false, ending = false;
+        let messageId = "1", failed = false, awaitingInput = false, ending = false;
         let closing: Promise<void> = Promise.resolve();
         const text = (id: string, value: string, append = false) => {
             const found = c.messages.find(m => m.id === id);
@@ -250,8 +251,10 @@ export class ConversationRuntime {
                 c.tools = [...c.tools.filter(t => t.key !== `${r.id}:${e.toolCallId}`), t];
                 send({ type: "tool_step", status: start ? "start" : "end", messageId, candidates: t.candidates, name: e.toolName, toolCallId: e.toolCallId, isError: !start && e.isError, navigationStatus: t.status === "selection" ? "needs_selection" : undefined });
             }
-            else if (e.type === "run_end" && e.status !== "completed")
-                failed = true;
+            else if (e.type === "run_end") {
+                failed = e.status === "failed";
+                awaitingInput = e.status === "awaiting_input";
+            }
             if (e.type === "assistant_message" || e.type === "tool_execution_end") {
                 try {
                     if (!this.store.save(c, r.id))
@@ -266,7 +269,7 @@ export class ConversationRuntime {
         res.once("close", () => { if (!ending)
             void r.stop("连接断开，本次回复已中断。"); });
         try {
-            const answer = await this.scope.run(r, () => entry!.agent.prompt(question));
+            const answer = await this.scope.run(r, () => entry!.agent.prompt(question, { requestContext: { pageContext } }));
             if (!this.live(r) || ending)
                 return;
             if (failed) {
@@ -277,15 +280,23 @@ export class ConversationRuntime {
                 return;
             // Minimal test/channel agents may omit model lifecycle events; keep final separate from tool preamble.
             if (c.tools.some(t => t.messageId === `${r.id}:${messageId}`)) messageId = String(Number(messageId) + 1);
+            const previousMessages = structuredClone(c.messages);
+            const previousContext = c.context;
             text(`${r.id}:${messageId}`, answer || "本次未生成回复。");
-            const finalKind = c.tools.filter(t => t.key.startsWith(r.id + ':')).at(-1)?.status === "selection" ? "selection" : "answer";
+            const finalKind = awaitingInput || c.tools.filter(t => t.key.startsWith(r.id + ':')).at(-1)?.status === "selection" ? "selection" : "answer";
             classify(finalKind);
-            c.context = structuredClone(entry.agent.context ?? []);
-            if (!this.store.finish(c, r.id, true))
-                throw new Error("write fenced");
+            try {
+                c.context = structuredClone(entry.agent.context ?? []);
+                if (!this.store.finish(c, r.id, true)) throw new Error("write fenced");
+            } catch (error) {
+                // 最终保存失败后，停止路径不能把尚未提交的候选答案保存成正式消息。
+                c.messages = previousMessages;
+                c.context = previousContext;
+                throw error;
+            }
             ending = true;
             detach();
-            send({ type: "final", messageId, kind: finalKind, text: answer || "本次未生成回复。" });
+            send({ type: "final", messageId, kind: finalKind, status: awaitingInput ? "awaiting_input" : "completed", text: answer || "本次未生成回复。" });
             closing = observer.end("detached");
             await closing;
             release();

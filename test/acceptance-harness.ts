@@ -203,6 +203,10 @@ export function classifyRun(c: AcceptanceCase, obs: RunObservation): CaseResult 
   if (obs.timedOut) {
     return { ...base, status: "FAILED", reason: `案例超时（>${c.maxDurationMs ?? DEFAULT_CASE_BUDGET_MS}ms）`, ...stats };
   }
+  const end = [...obs.events].reverse().find(e => e.type === "run_end");
+  if (end?.type === "run_end" && end.status === "awaiting_input") {
+    return { ...base, reason: "awaiting_input：等待补充，不计作任务完成", answer: obs.answer, ...stats };
+  }
   if (stopReason !== "stop") {
     return { ...base, status: "FAILED", reason: `非自然结束（stopReason=${stopReason}）`, answer: obs.answer, ...stats };
   }

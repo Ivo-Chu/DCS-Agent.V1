@@ -238,7 +238,13 @@ export function createWebServer(deps: WebServerDeps = {}): http.Server {
                     json(res, 400, { ok: false, message: "问题为空或超过2000字。" });
                     return;
                 }
-                await runtime.chat(session, c, question, res);
+                // Browser context is a request-local locating hint, never identity or authorization.
+                const hint = b.pageContext as Record<string, unknown> | undefined;
+                const pageContext = hint && typeof hint === "object" ? {
+                    title: typeof hint.title === "string" ? hint.title.slice(0, 200) : undefined,
+                    path: typeof hint.path === "string" ? hint.path.slice(0, 500) : undefined,
+                } : undefined;
+                await runtime.chat(session, c, question, res, pageContext);
                 return;
             }
             json(res, 404, { ok: false });

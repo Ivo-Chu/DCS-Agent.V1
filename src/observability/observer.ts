@@ -319,6 +319,7 @@ export function attachRunObserver(
             channel: opts.channel,
             model,
             provider: e.provider ?? null,
+            policyState: e.policyState ? redactValue(e.policyState) : null,
           });
           break;
         }
@@ -349,6 +350,8 @@ export function attachRunObserver(
             hasSystemPrompt: e.hasSystemPrompt,
             toolSchemaCount: e.toolSchemaCount,
             // 本轮实际发送给模型的完整上下文（凭据脱敏后的日志副本；
+            toolChoice: e.toolChoice ?? "auto",
+            policyState: e.policyState ? redactValue(e.policyState) : null,
             // 快照在发射时固定，之后的运行时变化不影响本记录）
             systemPromptText: sysPrompt ?? null,
             contextMessages: e.contextMessages ? redactContextMessages(e.contextMessages, Infinity).messages : null,
@@ -390,6 +393,8 @@ export function attachRunObserver(
             runId: e.runId,
             event: "model_call_end",
             output: e.output ? { content: redactText(e.output.content), toolCalls: e.output.toolCalls.map(tc => ({ ...tc, arguments: redactText(tc.arguments) })) } : null,
+            draftDisposition: e.draftDisposition ?? null,
+            policyState: e.policyState ? redactValue(e.policyState) : null,
             turn: e.turn,
             durationMs: e.durationMs,
             stopReason: e.stopReason,
@@ -527,6 +532,8 @@ export function attachRunObserver(
             event: "run_end",
             status: e.status,
             reason: e.reason,
+            completionReason: e.completionReason ?? e.reason,
+            policyState: e.policyState ? redactValue(e.policyState) : null,
             elapsedMs: e.elapsedMs,
             modelCalls: e.modelCalls,
             toolCalls: e.toolCalls,

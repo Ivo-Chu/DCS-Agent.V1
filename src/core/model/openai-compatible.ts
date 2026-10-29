@@ -88,6 +88,25 @@ function mapFinishReason(reason: string | null | undefined): "stop" | "length" |
   return "stop";
 }
 
+/** Qwen 网关的约束生成不支持 uniqueItems；执行端仍保留原校验。
+ * 只遍历 Schema 位置，不改同名业务属性或 enum/default 中的数据。
+ */
+function qwenToolParameters(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
+  return Object.fromEntries(Object.entries(schema).filter(([key]) => key !== "uniqueItems").map(([key, value]) => {
+    if (["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"].includes(key) && value && typeof value === "object") {
+      return [key, Object.fromEntries(Object.entries(value).map(([name, child]) => [name, qwenToolParameters(child)]))];
+    }
+    if (["allOf", "anyOf", "oneOf", "prefixItems"].includes(key) && Array.isArray(value)) {
+      return [key, value.map(qwenToolParameters)];
+    }
+    if (["items", "additionalProperties", "additionalItems", "contains", "not", "if", "then", "else", "propertyNames", "unevaluatedProperties", "unevaluatedItems"].includes(key)) {
+      return [key, Array.isArray(value) ? value.map(qwenToolParameters) : qwenToolParameters(value)];
+    }
+    return [key, value];
+  }));
+}
+
 /** 从 OpenAI 兼容 usage 对象提取 Token 用量（未提供的字段不填，不估算）。 */
 function parseUsage(raw: unknown): TokenUsage | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
@@ -140,13 +159,13 @@ export function createOpenAiStreamFn(options: OpenAiStreamOptions = {}): StreamF
       body.chat_template_kwargs = { enable_thinking: false };
     }
     if (req.tools.length > 0) {
-      body.tool_choice = "auto";
+      body.tool_choice = req.toolChoice ?? "auto";
       body.tools = req.tools.map((t: ToolSchema) => ({
         type: "function",
         function: {
           name: t.name,
           description: t.description,
-          parameters: t.parameters,
+          parameters: model === "Qwen3.5-35B" ? qwenToolParameters(t.parameters) : t.parameters,
         },
       }));
     }

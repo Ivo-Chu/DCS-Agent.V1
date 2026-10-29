@@ -135,7 +135,7 @@ export interface ToolCallView {
 }
 
 export interface RunSummary {
-  status: "completed" | "failed";
+  status: "completed" | "failed" | "awaiting_input";
   reason: string;
   modelCalls: number;
   toolCalls: number;
@@ -161,6 +161,7 @@ export interface RunSummary {
 
 const REASON_TEXT: Record<string, string> = {
   completed: "正常完成",
+  awaiting_input: "等待用户补充或选择（尚未完成任务）",
   max_turns: "达到最大执行轮次",
   model_error: "模型接口失败",
   unexpected: "其他异常",
@@ -304,7 +305,7 @@ export function formatRunEnd(s: RunSummary): string {
   lines.push(
     s.status === "completed"
       ? `  状态：${green("成功")}`
-      : `  状态：${red("失败")}`
+      : s.status === "awaiting_input" ? "  状态：等待用户补充" : `  状态：${red("失败")}`
   );
   lines.push(`  原因：${REASON_TEXT[s.reason] ?? s.reason}`);
   lines.push("");

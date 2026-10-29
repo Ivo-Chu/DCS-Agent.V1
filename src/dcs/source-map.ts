@@ -9,10 +9,18 @@ export interface SourceReference {
 }
 export interface SourceEntry {
   name: string; aliases: string[]; page: string; controller: string; action: string;
+  /** 仅填写已核对的菜单上下文；缺省时不推测线上菜单关系。 */
+  menuContext?: string[];
   verification: { status: "verified" | "unverified"; basis: string; checkedAt: string };
   references: SourceReference[];
 }
 export interface SourceMap { version: 1; entries: SourceEntry[] }
+export interface SourceMatchBasis {
+  field: "name" | "alias" | "menuContext" | "page";
+  value: string;
+  match: "exact" | "query_contains" | "entry_contains";
+}
+export type SourceCandidate = SourceEntry & { matchBasis: SourceMatchBasis[] };
 export const sourceMapPath = () => path.resolve(process.env.DCS_SOURCE_MAP_FILE || "data/harness-v1/source-map.json");
 
 /** 校验只证明已人工登记的定位依据仍存在，不自动推导菜单关系或业务结论。 */
@@ -20,6 +28,7 @@ export async function validateSourceEntry(entry: SourceEntry, root = sourceRoot(
   const issues: string[] = [];
   if (!entry || typeof entry.name !== "string" || !entry.name || !Array.isArray(entry.aliases) ||
     !entry.aliases.every(a => typeof a === "string" && a.length > 0) ||
+    (entry.menuContext !== undefined && (!Array.isArray(entry.menuContext) || !entry.menuContext.every(s => typeof s === "string" && s.trim()))) ||
     !entry.page || !entry.controller || !entry.action || entry.verification?.status !== "verified" ||
     !entry.verification.basis || !Number.isFinite(Date.parse(entry.verification.checkedAt))) issues.push("unverified_mapping");
   if (!Array.isArray(entry?.references) || !entry.references.length) return [...issues, "missing_references"];
@@ -48,17 +57,30 @@ export async function searchSourceMap(pattern: string, offset: number, limit: nu
   }
   const map: SourceMap = JSON.parse(bytes.toString("utf8"));
   if (map.version !== 1 || !Array.isArray(map.entries)) throw new Error("unsupported_source_map");
-  const query = pattern.trim().toLocaleLowerCase();
-  const candidates = map.entries.filter(e => [e.name, ...(Array.isArray(e.aliases) ? e.aliases : [])]
-    .some(s => typeof s === "string" && s.toLocaleLowerCase().includes(query)));
-  const valid: SourceEntry[] = [], rejected: { name: string; issues: string[] }[] = [];
-  for (const entry of candidates) {
+  const normalize = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  const query = normalize(pattern);
+  const valid: SourceCandidate[] = [], rejected: { name: string; issues: string[] }[] = [];
+  for (const entry of map.entries) {
+    const labels: { field: SourceMatchBasis["field"]; value: string }[] = [
+      { field: "name", value: entry.name }, { field: "page", value: entry.page },
+      ...(Array.isArray(entry.aliases) ? entry.aliases.map(value => ({ field: "alias" as const, value })) : []),
+      ...(Array.isArray(entry.menuContext) ? entry.menuContext.map(value => ({ field: "menuContext" as const, value })) : []),
+    ];
+    const matchBasis: SourceMatchBasis[] = [];
+    for (const { field, value } of labels) {
+      if (typeof value !== "string") continue;
+      const normalized = normalize(value);
+      if (!query || !normalized) continue;
+      const match = query === normalized ? "exact" : query.includes(normalized) ? "query_contains" : normalized.includes(query) ? "entry_contains" : undefined;
+      if (match) matchBasis.push({ field, value, match });
+    }
+    if (!matchBasis.length) continue;
     const issues = await validateSourceEntry(entry);
-    if (issues.length) rejected.push({ name: entry.name, issues }); else valid.push(entry);
+    if (issues.length) rejected.push({ name: entry.name, issues }); else valid.push({ ...entry, matchBasis });
   }
   const items = valid.slice(offset, offset + limit), hasMore = offset + items.length < valid.length;
   return { status: items.length ? "success" : "empty", indexVersion: map.version,
     indexSha256: createHash("sha256").update(bytes).digest("hex"), items, rejected, hasMore,
     nextOffset: hasMore ? offset + items.length : null,
-    hint: "索引仅是定位线索；使用read_dcs_code核实实际实现。无匹配或失效时继续files/text搜索。" };
+    hint: "索引仅是定位线索；保留全部匹配候选，同名或上下文相近不代表已确定目标。按候选路径缩小directory/glob或使用read_dcs_code读取；无匹配或失效时继续files/text搜索。" };
 }

@@ -6,14 +6,34 @@
 
 ---
 
+## 自然语言取证 V2（2026-10-28，候选实现）
+
+现有 DCS Web 聊天直接输入普通中文问题即可，例如“通讯录怎么查不到其他厂区的人？”。实质性请求默认进入取证；整条问候/感谢/结束语、已有回答的明确简化或格式改写才保留 auto 流式回答。混合问候、新业务追问及不确定输入仍取证。这是保守产品策略，不是完美自然语言分类。CLI/企微保持原入口默认策略；`/查源码` 保留为源码专用兼容入口，空指令不请求模型。
+
+首轮 required 提供当前已配置且在服务端执行范围内的工具，模型选择文档、源码、授权数据或导航；后续 auto 仍受同一工具边界限制。源码需配置真实 DCS_SOURCE_ROOT，知识库需配置和已有索引，数据库需已有连接配置；不进行额外健康探测或提升权限。`request_clarification` 仅允许缺失信息类型，输出固定问题并结束为 awaiting_input，不计为证据或任务完成。仅剩澄清工具时直接说明调查能力不可用。
+
+复用 evidence 模块分别记录实际回填模型的文档原文及出处、源码路径/行号、执行查询及完整性、导航状态。文件路径、地图、表结构、资源文字、错误和模型自述不算依据；空查询仅支持本次已返回范围内无记录。opened/switched 后可继续调查复合问题，无其他依据时最终仅允许固定导航确认；needs_selection 等待用户选择。没有依据时仍最多补救一次，不延长预算。
+
+业务地图匹配名称、别名、可选菜单上下文和页面路径，规范化后支持问题包含业务名称，保留全部候选和 matchBasis。取证前轻量本地匹配不算工具证据；已验证目标存在时，无关文件不能满足目标源码门槛。sourceContentObtained 仍只表示取得过源码，sourceRelations 单独记录与引用范围的关系；未登记目标、同名歧义及未经核实的跨模块关系仍未确认，不禁止继续读取。当前前端未主动提供页面上下文；API 可选 pageContext `{title,path}` 仅作本次定位线索，已做合成 HTTP 验证，不能声称已接通真实页面上下文。
+
+源码搜索结果注明 literal/regex/glob/feature。疑似正则但未启用 regex 只提示、不改语义；连续空结果提示检查模式和目录。显式窄目录 text 搜索在同 Run、条件/分页相同且文件成员与内容哈希一致时可复用，最多 64 文件/2 MiB/16 项；全库或无法核验的范围继续真实搜索。源码读取输出 requestedRange、returnedRange、endReason、next；coverage=not_assessed，hasMore=false 不代表业务已查全。阅读与回答提示要求完整表单/过滤实现、多要点覆盖、输入类型及具体边界值；这些提示不能保证答案正确。
+
+调查模式的所有候选文字均先缓冲，工具进度照常显示；中间/被拦截草稿不进入正式消息或后续上下文，保留 ToolCall/ToolResult 配对。JSONL 记录每轮 toolChoice、实际工具 Schema、policyState（状态与来源）、draftDisposition 和最终 completionReason；原始草稿只在诊断日志中保留。模型错误、取消、超时和轮数耗尽仍按失败退出。
+
+`npm run check` 包含策略、Loop、真实 Web HTTP 入口、地图/缓存和阅读范围的合成离线回归。`node --import tsx test/evidence-live.ts --v2` 复用 Web 工厂和 JSONL，对三道普通中文问题做集团模型烟测，只允许源码工具和固定澄清；不查询生产数据库或实际导航。可用 `--case=contacts|jobs|dorm` 针对性复测。V2 原始 Trace 位于忽略目录 `data/harness-v1/v2/runs/`；不带 --v2 的旧入口保留。这是流程/缺陷烟测，不是业务成功率评测。Qwen 序列化仅移除不兼容的模型侧 uniqueItems，原 Schema 和执行端校验保留。
+
+三个批次分别为入口与按来源取证、地图与搜索、阅读与回答质量。本机 `data/harness-v1/v2/stage-0..3` 保存批次前后文件及哈希，保留实施前所有未提交修改。按 3→2→1 顺序运行 `node data/harness-v1/v2/rollback.mjs N` 可单批回退；脚本发现快照后改动会拒绝覆盖，回退后需重跑 check。此目录被 Git 忽略，不随仓库分发。本轮没有自动重启或部署；使用当前候选需重启 Agent Node Web 后端（`npm run web`），不是仅刷新网页；本轮未修改前端构建。
+
+当前验证状态：三个批次及最终完整 `npm run check` 均通过，V2 新增 59 项合成场景（策略30、Web11、搜索地图10、阅读8）；真实本地地图四种自然中文查询匹配并通过引用校验。集团模型烟测尚未执行：自动审批拒绝向具体端点发送内部源码片段，正在等待明确出站授权；不能声称工具选择、业务正确率或耗时已有改善。详细状态见本机 `data/harness-v1/v2/verification-status.json`，最终离线日志为 `batch3-final-check.log`。
+
 ## Harness V1 候选原型（2026-10-28，尚未生产验收）
 
-- 保留现有单 Agent / AgentLoop、Qwen Provider、工具注册与 JSONL 观测链路。生产 `prompt.ts` 未修改；按需调查 Prompt 仅在 `test/harness-v1-live.ts` 的 C 配置中替换。
+- 保留现有单 Agent / AgentLoop、Qwen Provider、工具注册与 JSONL 观测链路。Harness V1 对比时按需 Prompt 仅用于 C 配置；后续 V2 已移除生产 Prompt 的固定工具组合要求，并补充阅读边界提示，见上节。
 - `search_dcs_code` 增加 `mode: "feature"`，仅接受 `pattern/offset/limit`；业务入口未找到或失效时可继续使用原有 `files/text`。结果仅提供线索，需 `read_dcs_code` 核实业务实现。
 - 本地地图默认 `data/harness-v1/source-map.json`，可由 `DCS_SOURCE_MAP_FILE` 指定。整个 `data/harness-v1/` 已忽略，不提交公司映射、标准事实及报告。字段结构为 `version: 1, entries: [{ name, aliases, page, controller, action, verification: { status, basis, checkedAt }, references: [{ path, startLine, endLine, sha256, role }] }]`。`role` 为 route/controller/view/implementation；必须具备前三种依据，所有引用复用既有路径边界检查，验证行号和文件全文 SHA-256。不自动生成“已验证”状态；登记前须核实路由、控制器和视图关系，哈希检查不能替代语义核实。
 - 第一版本地地图覆盖通讯录、重点/一般岗位、宿舍床位统计（宿舍管理的一个子功能）。仅确认当前静态源码的页面关系，未确认线上部署、菜单或员工权限。地图不含标准答案；评测事实另存 `cases.json`，只供评测端使用。
 - 参数错误返回 `status/field/actual/allowed/example`。仅文本搜索的非负整数 `contextLines > 5` 自动取 5，在结果 `corrections` 中记录原值和新值；其他字段不自动改写。结果新增 `kind: source/resource/other`、分页单位及解释，仍保留所有真实搜索结果、匹配行、上下文与续读位置。资源类型标注不是相关性排序。
-- 离线验证：`npm run test:harness:v1`（合成数据、真实 rg/文件系统）已纳入 `npm run check`。完整 check 已通过。同步修正了既有知识库测试依赖过期 Prompt 示例的断言，未修改生产 Prompt。
+- 离线验证：`npm run test:harness:v1`（合成数据、真实 rg/文件系统）已纳入 `npm run check`。当时完整 check 已通过，并修正了既有知识库测试依赖过期 Prompt 示例的断言。
 - 真实模型对比入口：`npm run test:harness:v1:live`。需先准备本地 `baseline/source-tools.ts`（固定原始工具）、`baseline/prompt.txt`、`source-map.json` 和 `cases.json`（至少三个领域，含 question/expectedFacts/evidence）。本机准备及固定记录保存在忽略目录；入口复用 `acceptance-harness.ts` 的结果分类/报告及现有 JSONL observer。A=原始工具/Prompt，B=参数与结果改进（不暴露 feature），C=B+feature+按需调查 Prompt。每题独立三次，轮换配置次序；固定模型、轮数与 120 秒预算，记录源码引用全文、地图、用例、工具和 Prompt 校验信息。
 - 实验为**源码隔离评测**：使用模拟身份，非源码工具统一返回不可用，不解析真实员工身份、不查询生产库。它不是完整线上 Agent 业务验收。标准答案不进入模型消息，业务正确率、定位准确率、错误恢复和无依据事实数留给逐 Trace 审核；不能用正常完成或工具命中代替成功。2026-10-28 经用户授权已完成 27 次真实 Qwen3.5 隔离运行（3领域 × A/B/C × 3次），源码引用校验保持一致；逐源码/Trace初评三组业务通过均为0/9，人工标准事实及业务签字仍待确认。目前不建议合并生产或扩大模块覆盖。
 - 当前可复查结果：本地 `data/harness-v1/offline-results.json`、`check.log`、`baseline/manifest.json`。直接重放三次 `contextLines:20` 输入，原始工具均报参数错误，候选均成功；四个业务入口均通过文件、行号及哈希校验。这是工具层验证，不能折算成模型业务成功率。原有 24 次通讯录运行仅作故障材料，不计为 24 道题。
@@ -148,7 +168,7 @@ agent.prompt("为什么我报不了餐？")
    Final AssistantMessage
 ```
 
-**停止策略只有两种**：模型自然停止（`stop` / `length` / `error`）、`maxTurns` 用尽（默认 8）。
+核心默认在模型停止或 `maxTurns` 用尽时退出（核心默认8，DCS工厂32）。DCS请求级策略还可要求一次补救、返回无法核实说明或结束为 awaiting_input；这些都复用同一个 Loop 和原预算。取证模式的截断、流中断、取消及模型错误仍按失败处理。
 明确裁剪掉的 Pi 机制：消息队列与 queue draining、shouldStopAfterTurn、prepareNextTurn、工具并行执行。
 
 ### 3.4 事件系统（最小生命周期集）

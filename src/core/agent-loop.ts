@@ -11,8 +11,8 @@
  * 执行链：历史 Context + 本轮 Prompts → LLM → ToolCall（如有）→ Tool Execution
  * → ToolResult → 下一 Turn LLM → …… → Final AssistantMessage
  *
- * 停止策略只有两种：模型自然停止（stop / length / error）、maxTurns 用尽。
- * 不实现消息队列、shouldStopAfterTurn、prepareNextTurn、工具并行执行。
+ * 默认按模型停止或 maxTurns 结束；可选单 Run 策略控制调用及结束检查。
+ * 不实现消息队列或第二套循环。
  *
  * 边界保证（审查修复 F2/F3/F6）：
  * - F2：非 toolCalls 完成时剥离残缺 toolCalls（不执行、不入历史），
@@ -34,6 +34,8 @@ import type {
   ToolOutput,
   ToolResultMessage,
   ToolSchema,
+  RunPolicy,
+  RunFinish,
 } from "./types.ts";
 
 export interface AgentLoopConfig<C = unknown> {
@@ -46,6 +48,8 @@ export interface AgentLoopConfig<C = unknown> {
   toolContext: C;
   maxTurns: number;
   emit: (e: AgentEvent) => void;
+  policy?: RunPolicy;
+  signal?: AbortSignal;
 }
 
 export interface AgentLoopResult {
@@ -59,6 +63,7 @@ export interface AgentLoopResult {
   toolCalls: number;
   /** maxTurns 耗尽终止（模型持续发起工具调用直到轮次用完）。 */
   endedByMaxTurns: boolean;
+  completionReason?: string;
 }
 
 function toToolSchema(t: ToolDefinition<any, unknown>): ToolSchema {
@@ -93,14 +98,34 @@ export async function runAgentLoop<C>(
   let endedByStop = false;
   let toolStep = 0;
   let modelCalls = 0;
+  let completionReason: string | undefined;
+  let policyMaxTurns = false;
+  const finish = (value: RunFinish) => {
+    completionReason = value.reason;
+    policyMaxTurns = value.reason === "max_turns";
+    const message: AssistantMessage = { role: "assistant", content: value.text,
+      stopReason: policyMaxTurns || value.reason === "model_error" ? "error" : "stop" };
+    workingMessages.push(message); newMessages.push(message);
+    config.emit({ type: "assistant_message", message });
+    if (message.stopReason === "error") config.emit({ type: "agent_error", message: value.text });
+    finalText = value.text; endedByStop = true;
+  };
   /** 上一轮模型调用时的消息数（用于计算增量）。 */
   let prevMessageCount: number | null = null;
 
   for (let turn = 0; turn < config.maxTurns; turn++) {
     // ---- 1. 调用模型（StreamFn 契约：永不 reject；此处再兜一层）----
     const turnNo = turn + 1;
+    if (config.signal?.aborted) { finish({ text: "本次执行已取消。", reason: "model_error" }); break; }
+    const plan = config.policy?.prepareTurn?.(turnNo);
+    if (plan?.finish) { finish(plan.finish); break; }
+    const offeredTools = plan?.toolNames ? config.tools.filter(t => plan.toolNames!.includes(t.name)) : config.tools;
+    const toolChoice = plan?.toolChoice ?? "auto";
+    if (toolChoice === "required" && offeredTools.length === 0) {
+      finish({ text: "本次没有可用工具，无法继续执行。", reason: "tools_unavailable" }); break;
+    }
     const messageCount = workingMessages.length;
-    const toolSchemas = config.tools.map(toToolSchema);
+    const toolSchemas = offeredTools.map(toToolSchema);
     config.emit({
       type: "model_call_start",
       runId: config.runId,
@@ -110,6 +135,8 @@ export async function runAgentLoop<C>(
       hasSystemPrompt: config.systemPrompt.length > 0,
       toolSchemaCount: toolSchemas.length,
       toolSchemas,
+      toolChoice,
+      policyState: config.policy?.snapshot?.(),
       // 观测快照：本轮实际传给模型的 System Prompt 与完整上下文消息。
       // 浅拷贝——之后运行时对 workingMessages 的 push 不影响已发射快照；
       // 消息内容来自运行时本身，不产生额外模型调用或工具执行。
@@ -124,6 +151,7 @@ export async function runAgentLoop<C>(
     let errorMessage: string | undefined;
     let usage: TokenUsage | undefined;
     let finishReason: string | undefined;
+    let receivedEnd = false;
     const toolCallsByIndex = new Map<number, ToolCall>();
 
     try {
@@ -131,11 +159,12 @@ export async function runAgentLoop<C>(
         systemPrompt: config.systemPrompt,
         messages: workingMessages,
         tools: toolSchemas,
+        toolChoice,
       })) {
         switch (ev.type) {
           case "text_delta":
             text += ev.text;
-            config.emit({ type: "message_delta", text: ev.text });
+            if (!config.policy?.bufferText) config.emit({ type: "message_delta", text: ev.text });
             break;
           case "tool_call_start":
             toolCallsByIndex.set(ev.index, {
@@ -150,6 +179,7 @@ export async function runAgentLoop<C>(
             break;
           }
           case "message_end":
+            receivedEnd = true;
             stopReason = ev.stopReason;
             if (ev.errorMessage) errorMessage = ev.errorMessage;
             if (ev.usage) usage = ev.usage;
@@ -163,6 +193,10 @@ export async function runAgentLoop<C>(
       errorMessage = `StreamFn 违反契约抛出异常：${String(err)}`;
     }
     const modelDurationMs = Date.now() - modelStartedAt;
+    if ((config.signal?.aborted && stopReason !== "error") || (config.policy?.bufferText && (!receivedEnd || stopReason === "length"))) {
+      errorMessage = config.signal?.aborted ? "本次执行已取消。" : !receivedEnd ? "模型调用失败（流中断）。" : "模型回复因长度限制被截断，本次未能生成最终回复。";
+      stopReason = "error";
+    }
 
     const toolCalls = [...toolCallsByIndex.entries()]
       .sort((a, b) => a[0] - b[0])
@@ -181,8 +215,10 @@ export async function runAgentLoop<C>(
         usage,
         errorMessage,
         finishReason,
+        draftDisposition: config.policy?.bufferText ? "discarded" : undefined,
+        policyState: config.policy?.snapshot?.(),
       });
-      const content = text
+      const content = text && !config.policy?.bufferText
         ? `${text}\n【模型调用失败】${errorMessage ?? ""}`
         : (errorMessage ?? "模型调用失败");
       const errorAssistant: AssistantMessage = {
@@ -212,6 +248,26 @@ export async function runAgentLoop<C>(
       }
     }
 
+    const stopping = stopReason !== "toolCalls" || effectiveToolCalls.length === 0;
+    const decision = stopping
+      ? config.policy?.checkFinish?.({ turn: turnNo, remainingTurns: config.maxTurns - turnNo }) : undefined;
+    const discarded = config.policy?.bufferText && (!stopping || !!decision);
+    if (discarded) content = "";
+    const emitModelEnd = () => config.emit({
+      type: "model_call_end", runId: config.runId, turn: turnNo, durationMs: modelDurationMs,
+      stopReason, toolCallCount: effectiveToolCalls.length, output: { content: text, toolCalls },
+      usage, errorMessage, finishReason,
+      draftDisposition: config.policy?.bufferText ? (discarded ? "discarded" : "accepted") : undefined,
+      policyState: config.policy?.snapshot?.(),
+    });
+    if (decision) {
+      emitModelEnd();
+      if ("finish" in decision) { finish(decision.finish); break; }
+      // 反馈只在本 Run 工作上下文中；被拦截候选不入历史，也不进入下一轮模型输入。
+      workingMessages.push({ role: "user", content: decision.retry });
+      continue;
+    }
+
     const assistant: AssistantMessage = {
       role: "assistant",
       content,
@@ -221,18 +277,7 @@ export async function runAgentLoop<C>(
     workingMessages.push(assistant);
     newMessages.push(assistant);
     config.emit({ type: "assistant_message", message: assistant });
-    config.emit({
-      type: "model_call_end",
-      runId: config.runId,
-      turn: turnNo,
-      durationMs: modelDurationMs,
-      stopReason,
-      toolCallCount: effectiveToolCalls.length,
-      output: { content: text, toolCalls },
-      usage,
-      errorMessage,
-      finishReason,
-    });
+    emitModelEnd();
     finalText = content;
 
     // ---- 3. 停止判定：模型自然停止（stop / length）或无工具调用 ----
@@ -256,15 +301,17 @@ export async function runAgentLoop<C>(
         step: toolStep,
       });
 
-      const tool = config.tools.find((t) => t.name === tc.name);
+      const tool = offeredTools.find((t) => t.name === tc.name);
       let outputText: string;
       let isError = false;
       let details: ToolOutput["details"] | undefined;
       let note: string | undefined;
       const toolStartedAt = Date.now();
 
-      if (!tool) {
-        outputText = `未知工具「${tc.name}」，可用工具：${config.tools
+      if (config.signal?.aborted) {
+        outputText = "本次执行已取消，工具未执行。"; isError = true;
+      } else if (!tool) {
+        outputText = `未知工具「${tc.name}」，本轮可用工具：${offeredTools
           .map((t) => t.name)
           .join("、")}`;
         isError = true;
@@ -337,6 +384,7 @@ export async function runAgentLoop<C>(
       };
       workingMessages.push(result);
       newMessages.push(result);
+      if (!config.signal?.aborted) config.policy?.onToolResult?.(tc, result);
       config.emit({
         type: "tool_execution_end",
         runId: config.runId,
@@ -355,12 +403,17 @@ export async function runAgentLoop<C>(
         rawText: rawText !== outputText ? rawText : undefined,
       });
     }
+    if (!config.signal?.aborted) {
+      const stop = config.policy?.afterTools?.();
+      if (stop) { finish(stop); break; }
+    }
     // 继续下一 Turn（若还有额度）
   }
 
   // F3：maxTurns 耗尽（模型持续发起工具调用直到轮次用完）时，
   // 生成明确终止说明写入 AssistantMessage——返回文本、事件、历史三者一致，
   // 不返回空答案
+  if (!endedByStop && config.signal?.aborted) finish({ text: "本次执行已取消。", reason: "model_error" });
   if (!endedByStop) {
     const content = `已达最大执行轮次（${config.maxTurns} 轮），本轮未能生成最终回复，请简化问题后重试。`;
     const terminated: AssistantMessage = {
@@ -375,5 +428,5 @@ export async function runAgentLoop<C>(
     finalText = content;
   }
 
-  return { newMessages, finalText, modelCalls, toolCalls: toolStep, endedByMaxTurns: !endedByStop };
+  return { newMessages, finalText, modelCalls, toolCalls: toolStep, endedByMaxTurns: !endedByStop || policyMaxTurns, completionReason };
 }

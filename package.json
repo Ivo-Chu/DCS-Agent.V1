@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "web": "tsx src/web/server.ts",
-    "check": "tsc --noEmit && tsx test/tools-readonly.test.ts && tsx test/smoke.ts && tsx test/acceptance.ts && tsx test/cli-display.ts && tsx test/wecom.test.ts && tsx test/web.test.ts && tsx test/web-sso-navigation.test.ts && tsx test/navigation-pairing.test.ts && tsx test/web-navigation-bridge.test.ts && tsx test/identity.test.ts && tsx test/agent-factory.test.ts && tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts && tsx test/observability.test.ts && tsx test/web-run-ownership.test.ts && tsx test/web-sso-http.test.ts && tsx test/web-conversations.test.ts && tsx test/log-viewer.test.ts && tsx test/harness-v1.test.ts",
+    "check": "tsc --noEmit && tsx test/model-schema-compat.test.ts && tsx test/evidence-policy.test.ts && tsx test/evidence-v2.test.ts && tsx test/evidence-loop.test.ts && tsx test/web-evidence.test.ts && tsx test/web-evidence-v2.test.ts && tsx test/tools-readonly.test.ts && tsx test/smoke.ts && tsx test/acceptance.ts && tsx test/cli-display.ts && tsx test/wecom.test.ts && tsx test/web.test.ts && tsx test/web-sso-navigation.test.ts && tsx test/navigation-pairing.test.ts && tsx test/web-navigation-bridge.test.ts && tsx test/identity.test.ts && tsx test/agent-factory.test.ts && tsx test/acceptance-harness.test.ts && tsx test/knowledge.test.ts && tsx test/observability.test.ts && tsx test/web-run-ownership.test.ts && tsx test/web-sso-http.test.ts && tsx test/web-conversations.test.ts && tsx test/log-viewer.test.ts && tsx test/harness-v1.test.ts && tsx test/source-navigation-v2.test.ts && tsx test/reading-v2.test.ts",
     "knowledge:e2e": "tsx scripts/knowledge-e2e.ts",
     "knowledge:ingest": "tsx scripts/knowledge-ingest.ts",
     "test": "tsx test/smoke.ts",
@@ -29,7 +29,7 @@
     "test:tools": "tsx test/tools-readonly.test.ts",
     "test:dcs": "node test/dcs-navigation.test.mjs",
     "test:logs": "tsx test/log-viewer.test.ts",
-    "test:harness:v1": "tsx test/harness-v1.test.ts",
+    "test:harness:v1": "tsx test/harness-v1.test.ts && tsx test/source-navigation-v2.test.ts && tsx test/reading-v2.test.ts",
     "test:harness:v1:live": "tsx test/harness-v1-live.ts"
   },
   "devDependencies": {
